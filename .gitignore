@@ -1,0 +1,23 @@
+# 运行数据（用户本地生成，不入库）
+config.json
+logs/
+
+# 构建产物与二进制（发布请用 GitHub Releases，不要提交到仓库）
+DeepSeek-Harness-Manager.exe
+dist/
+runtime/
+tools/*.exe
+tools/*.zip
+tools/*.pfx
+tools/DeepSeek-Harness.ico
+
+# 本机快捷方式
+*.lnk
+
+# 证书私钥（切勿提交！）
+*.pfx
+
+# IDE / 系统
+.vs/
+*.user
+Thumbs.db
