@@ -13,6 +13,9 @@ param(
     [string]$Notes = ""           # Release 说明，默认取 CHANGELOG.md 顶部小节
 )
 $ErrorActionPreference = 'Stop'
+# PowerShell 7+ 下 git 把正常进度信息写到 stderr，配合 $ErrorActionPreference='Stop'
+# 会被误判为异常并中断脚本（本次发布就因此在 push 后中断）。显式关闭该行为。
+$PSNativeCommandUseErrorActionPreference = $false
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path $csc)) { $csc = 'C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe' }
