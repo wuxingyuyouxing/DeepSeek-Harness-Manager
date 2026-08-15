@@ -1,4 +1,4 @@
-# build.ps1 — 一键构建 DeepSeek-Harness-Manager.exe（含便携 Node 准备）
+﻿# build.ps1 — 一键构建 DeepSeek-Harness-Manager.exe（含便携 Node 准备）
 # 依赖：Windows 自带 .NET Framework 4.8 编译器（csc.exe），无需安装任何 SDK。
 # 用法：powershell -ExecutionPolicy Bypass -File build.ps1
 $ErrorActionPreference = 'Stop'
@@ -24,7 +24,9 @@ if (-not (Test-Path $nodeExe)) {
 }
 
 # 2. 编译主程序
-& $csc /nologo /target:winexe /optimize+ `
+# /codepage:65001 强制按 UTF-8 读取源码（Manager.cs 为 UTF-8 无 BOM），
+# 否则在 GBK 代码页系统上中文注释/字符串会乱码，编译产物中文显示异常。
+& $csc /nologo /target:winexe /optimize+ /codepage:65001 `
     /out:"$root\DeepSeek-Harness-Manager.exe" `
     /win32icon:"$root\DeepSeek-Harness.ico" `
     /r:System.dll /r:System.Core.dll /r:System.Drawing.dll `

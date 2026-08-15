@@ -1,6 +1,6 @@
 # DeepSeek Harness 服务管理器
 
-> 当前版本：**v1.1.0** ｜ 更新记录见 [CHANGELOG.md](CHANGELOG.md)
+> 当前版本：**v1.1.1** ｜ 更新记录见 [CHANGELOG.md](CHANGELOG.md)
 
 一个轻量桌面工具（单文件 exe，无任何依赖），用来**一键管理本机的 DeepSeek Harness（`dsh web`）服务**。
 浅色/深色/跟随系统三种主题，标准原生窗口（原生最小化/最大化/关闭与动画），带系统托盘常驻，图标为 DeepSeek 官方鲸鱼 Logo。
@@ -67,8 +67,8 @@ DeepSeek-Harness-Manager.exe --cli stop  --port 3099
 
 | 文件 | 说明 |
 | --- | --- |
-| `DeepSeek-Harness-Manager-Setup-v1.1.exe` | **安装版**（35MB 单文件，类似 QQ/微信）：安装/升级向导、桌面/开始菜单快捷方式、卸载入口；已装用户重跑自动匹配原目录并升级 |
-| `DeepSeek-Harness-Manager-Portable-v1.1.zip` | **便携免安装版**：解压即用（含自带 Node），无需安装 |
+| `DeepSeek-Harness-Manager-Setup-v1.1.1.exe` | **安装版**（35MB 单文件，类似 QQ/微信）：安装/升级向导、桌面/开始菜单快捷方式、卸载入口；已装用户重跑自动匹配原目录并升级 |
+| `DeepSeek-Harness-Manager-Portable-v1.1.1.zip` | **便携免安装版**：解压即用（含自带 Node），无需安装 |
 | `数字签名说明.md` | 签名状态与正式签名指南 |
 | `CHANGELOG.md` | 版本更新记录 |
 

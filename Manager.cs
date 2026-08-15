@@ -29,8 +29,8 @@ using Timer = System.Windows.Forms.Timer;
 [assembly: AssemblyProduct("DeepSeek Harness Manager")]
 [assembly: AssemblyCompany("DeepSeek Harness")]
 [assembly: AssemblyCopyright("Copyright © 2026 DeepSeek Harness")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.1.1.0")]
+[assembly: AssemblyFileVersion("1.1.1.0")]
 
 namespace DshManager
 {
@@ -720,6 +720,8 @@ namespace DshManager
                 psi.CreateNoWindow = true;
                 psi.RedirectStandardOutput = true;
                 psi.RedirectStandardError = true;
+                psi.StandardOutputEncoding = Encoding.UTF8; // npx/npm 输出 UTF-8，避免中文乱码
+                psi.StandardErrorEncoding = Encoding.UTF8;
                 using (Process p = Process.Start(psi))
                 {
                     string o = p.StandardOutput.ReadToEnd();
@@ -729,6 +731,72 @@ namespace DshManager
                 }
             }
             catch { return ""; }
+        }
+
+        // 流式运行：stdout/stderr 逐行回调（后台线程触发），进程结束后回调 onExit(timedOut)。
+        // 用于安装等长耗时命令：让用户实时看到输出，而不是长时间静默。
+        // timeoutMs > 0 时启用整体超时：超时后强制 Kill 进程并回调 onExit(true)，避免永久卡住。
+        public static void RunStream(string file, string args, Action<string> onStdout, Action<string> onStderr, Action<bool> onExit, int timeoutMs = 0)
+        {
+            bool exited = false; // 防重入：正常退出 / 超时 / 启动失败 三路径只回调一次 onExit
+            System.Threading.Timer killTimer = null;
+            Process p = null;
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = file;
+                psi.Arguments = args;
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                psi.StandardOutputEncoding = Encoding.UTF8; // npx/npm 输出 UTF-8，避免中文乱码
+                psi.StandardErrorEncoding = Encoding.UTF8;
+                p = Process.Start(psi);
+                if (timeoutMs > 0)
+                {
+                    killTimer = new System.Threading.Timer(delegate
+                    {
+                        if (exited) return;
+                        exited = true;
+                        try { p.Kill(); } catch { }
+                        try { p.WaitForExit(2000); } catch { }
+                        try { p.Dispose(); } catch { }
+                        try { if (killTimer != null) killTimer.Dispose(); } catch { }
+                        if (onExit != null) onExit(true);
+                    }, null, timeoutMs, System.Threading.Timeout.Infinite);
+                }
+                p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+                {
+                    if (e.Data != null && onStdout != null) onStdout(e.Data);
+                };
+                p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+                {
+                    if (e.Data != null && onStderr != null) onStderr(e.Data);
+                };
+                p.EnableRaisingEvents = true;
+                p.Exited += delegate
+                {
+                    if (exited) return;
+                    exited = true;
+                    // 稍等片刻让最后的输出行排空，再收尾
+                    try { p.WaitForExit(800); } catch { }
+                    try { if (killTimer != null) killTimer.Dispose(); } catch { }
+                    try { p.Dispose(); } catch { } // 显式释放进程句柄
+                    if (onExit != null) onExit(false);
+                };
+                p.BeginOutputReadLine();
+                p.BeginErrorReadLine();
+            }
+            catch
+            {
+                if (!exited)
+                {
+                    exited = true;
+                    try { if (killTimer != null) killTimer.Dispose(); } catch { }
+                    if (onExit != null) onExit(false);
+                }
+            }
         }
 
         // 探测 URL 是否为 DSH 实例（页面含 __DSH_BOOT__ 标记）
@@ -1615,6 +1683,7 @@ namespace DshManager
         {
             Label l = new Label();
             l.Text = s;
+            l.BackColor = Color.Transparent; // Label 默认灰底，必须透明（深色主题下尤其明显）
             l.Font = new Font("Segoe UI", 9f, FontStyle.Regular);
             l.ForeColor = Theme.Current.TextMuted;
             return l;
@@ -1643,6 +1712,7 @@ namespace DshManager
         bool reallyExit;
         bool firstHide = true;
         bool themeAnimating;
+        bool installingDsh; // 防止「一键安装 dsh」重复点击
 
         // 布局
         int SideW = 226;
@@ -1820,7 +1890,7 @@ namespace DshManager
 
             tabBar = new BaseControl();
             tabBar.Dock = DockStyle.Top;   // 标签栏占顶部条带
-            tabBar.Height = TabH;
+            tabBar.Height = (int)Ui.P(TabH); // 必须随 DPI 缩放，否则高 DPI（如 200% 缩放）下按钮被下方页面遮住
 
             contentPanel = new Panel();
             contentPanel.Dock = DockStyle.Fill;
@@ -1910,7 +1980,7 @@ namespace DshManager
             side.Controls.Add(add);
 
             SectionLabel ver = new SectionLabel();
-            ver.Caption = "v" + Assembly.GetExecutingAssembly().GetName().Version.ToString(2);
+            ver.Caption = "v" + Assembly.GetExecutingAssembly().GetName().Version.ToString(3); // 显示完整版本(如 v1.1.1)，随 AssemblyVersion 自动更新
             ver.Faint = true;
             ver.Semibold = false;
             ver.FontSize = 8f;
@@ -2479,6 +2549,7 @@ namespace DshManager
             {
                 if (c is Label)
                 {
+                    c.BackColor = Color.Transparent; // Label 默认是系统灰底，一律透明以透出页面底色
                     string tag = (c.Tag as string) ?? "muted";
                     if (tag == "faint") c.ForeColor = Theme.Current.TextFaint;
                     else if (tag == "text") c.ForeColor = Theme.Current.Text;
@@ -2492,7 +2563,8 @@ namespace DshManager
                 }
                 else if (c is TextBox)
                 {
-                    c.BackColor = Theme.Current.SurfaceAlt;
+                    // Tag="page" 的输入框与页面底色完全一致（诊断页路径框，避免灰色底纹）
+                    c.BackColor = (c.Tag as string) == "page" ? Theme.Current.Page : Theme.Current.SurfaceAlt;
                     c.ForeColor = Theme.Current.Text;
                 }
                 c.Invalidate(true);
@@ -2563,6 +2635,9 @@ namespace DshManager
 
             Label lNode = new Label();
             lNode.Text = "node.exe（可选）";
+            // Label 默认 BackColor 是系统灰(SystemColors.Control)，深色页面上就是灰底块，
+            // 必须设透明以透出父级页面底色
+            lNode.BackColor = Color.Transparent;
             lNode.ForeColor = Theme.Current.TextMuted;
             lNode.Font = new Font("Segoe UI", 8.5f);
             lNode.Location = new Point((int)Ui.P(14), (int)Ui.P(8));
@@ -2571,6 +2646,13 @@ namespace DshManager
 
             tbNodePath = new TextBox();
             tbNodePath.ReadOnly = true;
+            // ReadOnly 输入框默认背景是系统灰，必须显式用主题色。
+            // 这里用与页面完全一致的 Page 色（Tag="page"），深色/浅色下都与页面融为一体，
+            // 只留细边框区分，不再有任何灰色底纹观感。
+            tbNodePath.Tag = "page";
+            tbNodePath.BackColor = Theme.Current.Page;
+            tbNodePath.ForeColor = Theme.Current.Text;
+            tbNodePath.BorderStyle = BorderStyle.FixedSingle;
             tbNodePath.Text = Settings.Data.NodePath;
             tbNodePath.Location = new Point((int)Ui.P(14), (int)Ui.P(26));
             tbNodePath.Size = new Size((int)Ui.P(430), (int)Ui.P(22));
@@ -2600,6 +2682,8 @@ namespace DshManager
 
             Label lDsh = new Label();
             lDsh.Text = "dsh 入口（可选）";
+            // 同上：Label 默认灰底，必须透明
+            lDsh.BackColor = Color.Transparent;
             lDsh.ForeColor = Theme.Current.TextMuted;
             lDsh.Font = new Font("Segoe UI", 8.5f);
             lDsh.Location = new Point((int)Ui.P(14), (int)Ui.P(50));
@@ -2608,6 +2692,11 @@ namespace DshManager
 
             tbDshPath = new TextBox();
             tbDshPath.ReadOnly = true;
+            // 同上：用页面色（Tag="page"），与页面完全一致，无灰色底纹
+            tbDshPath.Tag = "page";
+            tbDshPath.BackColor = Theme.Current.Page;
+            tbDshPath.ForeColor = Theme.Current.Text;
+            tbDshPath.BorderStyle = BorderStyle.FixedSingle;
             tbDshPath.Text = Settings.Data.DshPath;
             tbDshPath.Location = new Point((int)Ui.P(14), (int)Ui.P(68));
             tbDshPath.Size = new Size((int)Ui.P(430), (int)Ui.P(22));
@@ -2638,7 +2727,7 @@ namespace DshManager
             return page;
         }
 
-        // 通过 npx 安装 dsh CLI（后台执行，进度输出到诊断框）
+        // 通过 npx 安装 dsh CLI（后台执行，输出实时流式显示在诊断框，按钮显示已用秒数）
         void InstallDsh(PillButton btn)
         {
             if (DshService.NodeExe.Length == 0) DshService.Resolve();
@@ -2647,28 +2736,66 @@ namespace DshManager
                 MessageBox.Show(this, "未找到 node.exe，无法安装 dsh。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
+            if (installingDsh) return;
+            installingDsh = true;
             btn.Enabled = false;
-            btn.Label = "安装中…";
+            btn.Label = "安装中 0s";
             btn.Invalidate();
             AppendDiag("正在通过 npx 安装 @deepseek-ai/dsh（需要联网，首次约 1-2 分钟）…", Theme.Current.LogWarn);
-            Task.Run(delegate
+            AppendDiag("安装进度会实时显示在下方，请耐心等待。", Theme.Current.LogText);
+
+            // 按钮上显示已用秒数，让用户明确知道"正在安装、没有卡死"
+            DateTime start = DateTime.Now;
+            Timer ticker = new Timer();
+            ticker.Interval = 1000;
+            ticker.Tick += delegate
             {
-                string npx = Path.Combine(Path.GetDirectoryName(DshService.NodeExe), "npx.cmd");
-                string output = DshService.RunCapture(npx, "--yes @deepseek-ai/dsh --version");
-                SafeInvoke(delegate
+                int sec = (int)(DateTime.Now - start).TotalSeconds;
+                btn.Label = "安装中 " + sec + "s";
+                btn.Invalidate();
+            };
+            ticker.Start();
+
+            string npx = Path.Combine(Path.GetDirectoryName(DshService.NodeExe), "npx.cmd");
+            // cmd /c 包装确保 .cmd 可执行；stdout/stderr 逐行追加到诊断框（实时进度）
+            // 整体超时 10 分钟：网络卡死时自动终止安装进程并复位界面，避免永久"安装中"
+            DshService.RunStream("cmd.exe", "/c \"" + npx + "\" --yes @deepseek-ai/dsh --version",
+                delegate(string line)
                 {
-                    AppendDiag("npx 输出：" + (string.IsNullOrEmpty(output) ? "(空)" : output.Trim().Replace("\n", " / ")), Theme.Current.LogText);
-                    DshService.Resolve(); // 重新解析
-                    RunDiag();
-                    btn.Enabled = true;
-                    btn.Label = "一键安装 dsh";
-                    btn.Invalidate();
-                    if (DshService.BinJs.Length > 0)
-                        MessageBox.Show(this, "dsh 安装成功：" + DshService.BinJs + "\n版本：" + DshService.DshVersion, "安装完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    else
-                        MessageBox.Show(this, "安装可能未成功，请检查网络后重试。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                });
-            });
+                    string ln = line.Trim();
+                    if (ln.Length == 0) return;
+                    SafeInvoke(delegate { AppendDiag("  " + ln, Theme.Current.LogText); });
+                },
+                delegate(string line)
+                {
+                    string ln = line.Trim();
+                    if (ln.Length == 0) return;
+                    SafeInvoke(delegate { AppendDiag("  " + ln, Theme.Current.LogWarn); });
+                },
+                delegate(bool timedOut)
+                {
+                    SafeInvoke(delegate
+                    {
+                        try { ticker.Stop(); ticker.Dispose(); } catch { }
+                        btn.Enabled = true;
+                        btn.Label = "一键安装 dsh";
+                        btn.Invalidate();
+                        installingDsh = false;
+                        if (timedOut)
+                        {
+                            AppendDiag("安装超时（10 分钟），已终止安装进程。请检查网络后重试。", Theme.Current.LogErr);
+                            MessageBox.Show(this, "安装超时（10 分钟），已终止安装进程。\n请检查网络后重试。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return;
+                        }
+                        DshService.Resolve(); // 重新解析
+                        RunDiag();
+                        if (DshService.BinJs.Length > 0)
+                            MessageBox.Show(this, "dsh 安装成功：" + DshService.BinJs + "\n版本：" + DshService.DshVersion, "安装完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        else
+                            MessageBox.Show(this, "安装可能未成功，请检查网络后重试。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    });
+                },
+                600000); // 10 分钟整体超时
         }
 
         void RunDiag()
@@ -3049,9 +3176,21 @@ namespace DshManager
                         }
                         // 静默失败（看门狗触发）：只计数，不打扰
                     }
-                    else if (final == SvcState.Running && rt.Cfg.AutoOpenBrowser)
+                    else if (final == SvcState.Running)
                     {
-                        try { Process.Start(rt.Cfg.Url); } catch { }
+                        // 启动成功：明确告知访问地址，避免用户不知道要在浏览器中使用
+                        if (rt.Cfg.AutoOpenBrowser)
+                        {
+                            try { Process.Start(rt.Cfg.Url); } catch { }
+                            if (!silent)
+                            {
+                                try { tray.ShowBalloonTip(4000, "DeepSeek Harness", "服务已启动：" + rt.Cfg.Url + "\n已在浏览器中打开。", ToolTipIcon.Info); } catch { }
+                            }
+                        }
+                        else if (!silent)
+                        {
+                            try { tray.ShowBalloonTip(4000, "DeepSeek Harness", "服务已启动：" + rt.Cfg.Url + "\n在「概览」页点击「打开浏览器」即可使用。", ToolTipIcon.Info); } catch { }
+                        }
                     }
                     else if (final == SvcState.Occupied)
                         MessageBox.Show(this, "端口 " + rt.Cfg.Port + " 已被其他进程占用。", "DeepSeek Harness", MessageBoxButtons.OK, MessageBoxIcon.Warning);
