@@ -29,8 +29,8 @@ using Timer = System.Windows.Forms.Timer;
 [assembly: AssemblyProduct("DeepSeek Harness Manager")]
 [assembly: AssemblyCompany("DeepSeek Harness")]
 [assembly: AssemblyCopyright("Copyright © 2026 DeepSeek Harness")]
-[assembly: AssemblyVersion("1.1.1.0")]
-[assembly: AssemblyFileVersion("1.1.1.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
 
 namespace DshManager
 {
@@ -942,6 +942,139 @@ namespace DshManager
         }
     }
 
+    // ───────────────────────────────────────────────────────────── 更新检测
+    // 检测 dsh（npm registry）与管理器自身（GitHub Releases）是否有新版本；
+    // 版本比较用数字段 semver（支持 0.1.0-rc.7 / 1.1.1.0，rc.9 vs rc.10 不会比错）。
+    static class UpdateService
+    {
+        public static string DshLatest = "";        // npm 最新 dsh 版本（""=未查到）
+        public static string ManagerLatest = "";    // GitHub 最新管理器版本，无 v 前缀
+        public static string ManagerLatestUrl = ""; // 便携包 zip 下载地址
+        public static string ManagerChecksumsUrl = ""; // checksums.txt 资产地址（可能为空）
+        public static bool Checked;                 // 本次会话是否已自动检查过
+
+        // ── HTTP 工具 ──
+        public static string HttpGet(string url)
+        {
+            try
+            {
+                // .NET Framework 4.8 默认 TLS 协商可能过低，npm registry / GitHub API 均要求
+                // TLS 1.2+，不显式启用会报"未能创建 SSL/TLS 安全通道"，导致检查失败。
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = "GET";
+                req.Timeout = 10000;
+                req.ReadWriteTimeout = 10000;
+                req.UserAgent = "DSH-Manager/" + Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    return sr.ReadToEnd();
+            }
+            catch { return ""; }
+        }
+
+        // ── 版本比较：a < b 返回 -1，相等 0，a > b 返回 1 ──
+        // 规则：先比主版本数字段；主版本相同则 正式版 > 预发布(rc)；同为预发布比 rc 序号。
+        public static int CompareVersions(string a, string b)
+        {
+            if (a == b) return 0;
+            string coreA = a, coreB = b, preA = "", preB = "";
+            int da = a.IndexOf('-'), db = b.IndexOf('-');
+            if (da >= 0) { coreA = a.Substring(0, da); preA = a.Substring(da + 1); }
+            if (db >= 0) { coreB = b.Substring(0, db); preB = b.Substring(db + 1); }
+            int c = CompareCore(coreA, coreB);
+            if (c != 0) return c;
+            bool hasA = preA.Length > 0, hasB = preB.Length > 0;
+            if (hasA != hasB) return hasA ? -1 : 1; // 正式版(无预发布)更大
+            if (!hasA) return 0;
+            return LastNum(preA).CompareTo(LastNum(preB));
+        }
+
+        static int CompareCore(string a, string b)
+        {
+            string[] sa = a.Split('.'), sb = b.Split('.');
+            int n = Math.Max(sa.Length, sb.Length);
+            for (int i = 0; i < n; i++)
+            {
+                int x = 0, y = 0;
+                if (i < sa.Length) int.TryParse(sa[i], out x);
+                if (i < sb.Length) int.TryParse(sb[i], out y);
+                if (x != y) return x < y ? -1 : 1;
+            }
+            return 0;
+        }
+
+        static int LastNum(string pre)
+        {
+            string[] parts = pre.Split('.');
+            for (int i = parts.Length - 1; i >= 0; i--)
+            {
+                int n; if (int.TryParse(parts[i], out n)) return n;
+            }
+            return 0;
+        }
+
+        // ── 查 dsh 最新版本（npm registry，公开接口）──
+        public static string CheckDsh()
+        {
+            string body = HttpGet("https://registry.npmjs.org/@deepseek-ai/dsh/latest");
+            if (body.Length == 0) return "";
+            try
+            {
+                // JavaScriptSerializer 非线程安全，检测可能在后台线程并发调用，每次新建
+                Dictionary<string, object> d = new JavaScriptSerializer().DeserializeObject(body) as Dictionary<string, object>;
+                if (d != null && d.ContainsKey("version")) return d["version"].ToString();
+            }
+            catch { }
+            return "";
+        }
+
+        // ── 查管理器最新版本（GitHub Releases，公开接口）──
+        // 返回最新版本号（无 v 前缀）；同时填充便携包下载地址/大小/校验文件地址
+        public static string CheckManager()
+        {
+            string body = HttpGet("https://api.github.com/repos/wuxingyuyouxing/DeepSeek-Harness-Manager/releases/latest");
+            if (body.Length == 0) return "";
+            try
+            {
+                // 同上：每次新建，避免并发线程共享同一 JavaScriptSerializer
+                Dictionary<string, object> d = new JavaScriptSerializer().DeserializeObject(body) as Dictionary<string, object>;
+                if (d == null || !d.ContainsKey("tag_name")) return "";
+                string tag = d["tag_name"].ToString();
+                object[] assets = d["assets"] as object[];
+                if (assets != null)
+                {
+                    foreach (object o in assets)
+                    {
+                        Dictionary<string, object> ad = o as Dictionary<string, object>;
+                        if (ad == null || !ad.ContainsKey("name")) continue;
+                        string name = ad["name"].ToString();
+                        if (name == "checksums.txt")
+                            ManagerChecksumsUrl = ad.ContainsKey("browser_download_url") ? ad["browser_download_url"].ToString() : "";
+                        else if (name.IndexOf("Portable", StringComparison.OrdinalIgnoreCase) >= 0 && name.EndsWith(".zip"))
+                        {
+                            ManagerLatestUrl = ad.ContainsKey("browser_download_url") ? ad["browser_download_url"].ToString() : "";
+                        }
+                    }
+                }
+                return tag.TrimStart('v');
+            }
+            catch { return ""; }
+        }
+
+        // ── 一次性后台检查 dsh + 管理器，结果写入静态字段 ──
+        public static void CheckAllAsync(Action done)
+        {
+            Task.Run(delegate
+            {
+                DshLatest = CheckDsh();
+                ManagerLatest = CheckManager();
+                Checked = true;
+                if (done != null) done();
+            });
+        }
+    }
+
     // ───────────────────────────────────────────────────────────── CLI 自测模式
     static class Cli
     {
@@ -1170,6 +1303,13 @@ namespace DshManager
                 case Variant.GhostDanger:
                     fill = Color.FromArgb((int)(ColorX.Lerp(Color.FromArgb(0, 0, 0, 0), T.SurfaceAlt, hoverP).A), T.SurfaceAlt.R, T.SurfaceAlt.G, T.SurfaceAlt.B);
                     text = T.Err; border = T.BorderStrong; break;
+            }
+            // 禁用态：弱化文字与填充，让用户明确感知按钮不可点
+            if (!Enabled)
+            {
+                fill = Color.Transparent;
+                text = T.TextFaint;
+                border = T.Border;
             }
 
             if (fill != Color.Transparent) Draw.FillRound(g, new SolidBrush(fill), rc, rad);
@@ -1413,6 +1553,7 @@ namespace DshManager
         public bool Faint;          // 弱化文字（TextFaint）
         public bool UseTextColor;   // 用正文色（Text）
         public bool Semibold = true;
+        public Color CustomColor = Color.Empty; // 非空时优先使用（如"发现更新"的警告色）
 
         public SectionLabel()
         {
@@ -1422,7 +1563,7 @@ namespace DshManager
         protected override void OnPaint(PaintEventArgs e)
         {
             Theme T = Theme.Current;
-            Color c = UseTextColor ? T.Text : (Faint ? T.TextFaint : T.TextMuted);
+            Color c = CustomColor != Color.Empty ? CustomColor : (UseTextColor ? T.Text : (Faint ? T.TextFaint : T.TextMuted));
             Font f = new Font(Semibold ? "Segoe UI Semibold" : "Segoe UI", FontSize, FontStyle.Regular);
             Draw.Text(e.Graphics, Caption, f, c, ClientRectangle, ContentAlignment.MiddleLeft);
             f.Dispose();
@@ -1714,6 +1855,12 @@ namespace DshManager
         bool themeAnimating;
         bool installingDsh; // 防止「一键安装 dsh」重复点击
 
+        // 关于页
+        SectionLabel lblAboutDshVer, lblAboutDshStatus, lblAboutMgrVer, lblAboutMgrStatus;
+        PillButton btnDshCheck, btnDshUpgrade, btnMgrCheck, btnMgrUpdate;
+        Label lblEnvInfo;
+        bool aboutBusy; // 更新检查/下载进行中
+
         // 布局
         int SideW = 226;
         int TabH = 44;
@@ -1773,6 +1920,8 @@ namespace DshManager
 
             if (minimized) { Hide(); }
             else { Show(); }
+
+            AutoCheckUpdates(); // 启动后静默检查一次 dsh/管理器更新（异步，失败静默）
         }
 
         // ── 托盘 ──
@@ -1903,6 +2052,7 @@ namespace DshManager
             contentPanel.Controls.Add(BuildLogs());
             contentPanel.Controls.Add(BuildSettings());
             contentPanel.Controls.Add(BuildDiag());
+            contentPanel.Controls.Add(BuildAbout());
             contentPanel.Controls.Add(tabBar);
 
             // 标签栏
@@ -2112,12 +2262,12 @@ namespace DshManager
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
 
-                string[] tabs = { "概览", "日志", "设置", "诊断" };
+                string[] tabs = { "概览", "日志", "设置", "诊断", "关于" };
                 float x = Ui.P(18);
                 float w = Ui.P(72);
                 for (int i = 0; i < tabs.Length; i++)
                 {
-                    bool act = (activeTab == (i == 0 ? "overview" : i == 1 ? "logs" : i == 2 ? "settings" : "diag"));
+                    bool act = (activeTab == (i == 0 ? "overview" : i == 1 ? "logs" : i == 2 ? "settings" : i == 3 ? "diag" : "about"));
                     Font f = new Font("Segoe UI", 9.5f, act ? FontStyle.Bold : FontStyle.Regular);
                     Color c = act ? T.Accent : T.TextMuted;
                     RectangleF rc = new RectangleF(x, Ui.P(6), w, Ui.P(32));
@@ -2134,7 +2284,7 @@ namespace DshManager
             {
                 float x = Ui.P(18);
                 float w = Ui.P(72);
-                string[] tabs = { "overview", "logs", "settings", "diag" };
+                string[] tabs = { "overview", "logs", "settings", "diag", "about" };
                 for (int i = 0; i < tabs.Length; i++)
                 {
                     RectangleF rc = new RectangleF(x, Ui.P(6), w, Ui.P(32));
@@ -2158,6 +2308,7 @@ namespace DshManager
             if (name == "diag") RunDiag();
             if (name == "logs") RefreshLogs();
             if (name == "settings") RefreshSettings();
+            if (name == "about") RefreshAbout();
             FadeInPage(page);
         }
 
@@ -2624,7 +2775,7 @@ namespace DshManager
             btnInstall.Label = "一键安装 dsh";
             btnInstall.Location = new Point((int)Ui.P(242), (int)Ui.P(7));
             btnInstall.Size = new Size((int)Ui.P(116), (int)Ui.P(32));
-            btnInstall.Click += delegate { InstallDsh(btnInstall); };
+            btnInstall.Click += delegate { InstallDsh(btnInstall, "一键安装 dsh"); };
             bar.Controls.Add(btnInstall);
 
             // 手动指定 node/dsh 路径（适配源码仓库/自建安装等非标准方式）
@@ -2727,8 +2878,529 @@ namespace DshManager
             return page;
         }
 
-        // 通过 npx 安装 dsh CLI（后台执行，输出实时流式显示在诊断框，按钮显示已用秒数）
-        void InstallDsh(PillButton btn)
+        // ── 关于页：版本信息 / 更新检查 / 运行环境 / 链接 ──
+        // 布局说明：控件直接放在页面上（页面底色），卡片区域只画圆角边框、不填充 Surface，
+        // 因此所有文字/按钮背景都与页面一致，任何主题下都不会出现灰色底纹。
+        Control BuildAbout()
+        {
+            BaseControl page = new BaseControl();
+            page.Dock = DockStyle.Fill;
+            tabPages["about"] = page;
+
+            // 标题区：鲸鱼图标 + 名称 + 副标题
+            PictureBox logo = new PictureBox();
+            try { logo.Image = Icon.ExtractAssociatedIcon(Application.ExecutablePath).ToBitmap(); } catch { }
+            logo.SizeMode = PictureBoxSizeMode.StretchImage;
+            logo.BackColor = Color.Transparent; // PictureBox 默认灰底(SystemColors.Control)，必须透明
+            logo.Size = new Size((int)Ui.P(40), (int)Ui.P(40));
+            logo.Location = new Point((int)Ui.P(20), (int)Ui.P(16));
+            page.Controls.Add(logo);
+
+            SectionLabel title = new SectionLabel();
+            title.Caption = "DeepSeek Harness 管理器";
+            title.UseTextColor = true;
+            title.Semibold = true;
+            title.FontSize = 15f;
+            title.Location = new Point((int)Ui.P(70), (int)Ui.P(18));
+            title.Size = new Size((int)Ui.P(320), (int)Ui.P(28));
+            page.Controls.Add(title);
+
+            SectionLabel subtitle = new SectionLabel();
+            subtitle.Caption = "管理 dsh web 本地服务 · 版本 v" + Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
+            subtitle.Faint = true;
+            subtitle.Semibold = false;
+            subtitle.FontSize = 9f;
+            subtitle.Location = new Point((int)Ui.P(70), (int)Ui.P(44));
+            subtitle.Size = new Size((int)Ui.P(420), (int)Ui.P(20));
+            page.Controls.Add(subtitle);
+
+            // ── 更新检查区 ──
+            SectionLabel lUpd = new SectionLabel();
+            lUpd.Caption = "更新检查";
+            lUpd.Location = new Point((int)Ui.P(34), (int)Ui.P(88));
+            lUpd.Size = new Size((int)Ui.P(200), (int)Ui.P(20));
+            page.Controls.Add(lUpd);
+
+            SectionLabel lDsh = new SectionLabel();
+            lDsh.Caption = "dsh 版本";
+            lDsh.Semibold = false;
+            lDsh.FontSize = 9.5f; // 与右侧版本值同字号同控件，保证水平齐平
+            lDsh.Location = new Point((int)Ui.P(34), (int)Ui.P(116));
+            lDsh.Size = new Size((int)Ui.P(64), (int)Ui.P(22)); // 宽度按文字收窄，绝不给右侧版本值重叠
+            page.Controls.Add(lDsh);
+
+            lblAboutDshVer = new SectionLabel();
+            lblAboutDshVer.UseTextColor = true;
+            lblAboutDshVer.Semibold = false;
+            lblAboutDshVer.FontSize = 9.5f;
+            lblAboutDshVer.Location = new Point((int)Ui.P(110), (int)Ui.P(116));
+            lblAboutDshVer.Size = new Size((int)Ui.P(200), (int)Ui.P(22));
+            page.Controls.Add(lblAboutDshVer);
+
+            btnDshUpgrade = new PillButton();
+            btnDshUpgrade.Kind = PillButton.Variant.Primary;
+            btnDshUpgrade.Label = "一键升级 dsh";
+            btnDshUpgrade.Size = new Size((int)Ui.P(116), (int)Ui.P(30));
+            btnDshUpgrade.Click += delegate { UpgradeDsh(btnDshUpgrade); };
+            page.Controls.Add(btnDshUpgrade);
+
+            btnDshCheck = new PillButton();
+            btnDshCheck.Kind = PillButton.Variant.Ghost;
+            btnDshCheck.Label = "检查更新";
+            btnDshCheck.Size = new Size((int)Ui.P(88), (int)Ui.P(30));
+            btnDshCheck.Click += delegate { CheckUpdates(); };
+            page.Controls.Add(btnDshCheck);
+
+            lblAboutDshStatus = new SectionLabel();
+            lblAboutDshStatus.Faint = true;
+            lblAboutDshStatus.Semibold = false;
+            lblAboutDshStatus.FontSize = 8.5f;
+            lblAboutDshStatus.Location = new Point((int)Ui.P(34), (int)Ui.P(146));
+            lblAboutDshStatus.Size = new Size((int)Ui.P(560), (int)Ui.P(20));
+            page.Controls.Add(lblAboutDshStatus);
+
+            SectionLabel lMgr = new SectionLabel();
+            lMgr.Caption = "管理器版本";
+            lMgr.Semibold = false;
+            lMgr.FontSize = 9.5f; // 与右侧版本值同字号同控件，保证水平齐平
+            lMgr.Location = new Point((int)Ui.P(34), (int)Ui.P(176));
+            lMgr.Size = new Size((int)Ui.P(72), (int)Ui.P(22)); // 宽度按文字收窄(5字≈66px)，绝不给右侧版本值重叠
+            page.Controls.Add(lMgr);
+
+            lblAboutMgrVer = new SectionLabel();
+            lblAboutMgrVer.UseTextColor = true;
+            lblAboutMgrVer.Semibold = false;
+            lblAboutMgrVer.FontSize = 9.5f;
+            lblAboutMgrVer.Location = new Point((int)Ui.P(110), (int)Ui.P(176));
+            lblAboutMgrVer.Size = new Size((int)Ui.P(200), (int)Ui.P(22));
+            page.Controls.Add(lblAboutMgrVer);
+
+            btnMgrUpdate = new PillButton();
+            btnMgrUpdate.Kind = PillButton.Variant.Primary;
+            btnMgrUpdate.Label = "下载并更新";
+            btnMgrUpdate.Size = new Size((int)Ui.P(116), (int)Ui.P(30));
+            btnMgrUpdate.Click += delegate { UpdateManager(btnMgrUpdate); };
+            page.Controls.Add(btnMgrUpdate);
+
+            btnMgrCheck = new PillButton();
+            btnMgrCheck.Kind = PillButton.Variant.Ghost;
+            btnMgrCheck.Label = "检查更新";
+            btnMgrCheck.Size = new Size((int)Ui.P(88), (int)Ui.P(30));
+            btnMgrCheck.Click += delegate { CheckUpdates(); };
+            page.Controls.Add(btnMgrCheck);
+
+            lblAboutMgrStatus = new SectionLabel();
+            lblAboutMgrStatus.Faint = true;
+            lblAboutMgrStatus.Semibold = false;
+            lblAboutMgrStatus.FontSize = 8.5f;
+            lblAboutMgrStatus.Location = new Point((int)Ui.P(34), (int)Ui.P(206));
+            lblAboutMgrStatus.Size = new Size((int)Ui.P(560), (int)Ui.P(20));
+            page.Controls.Add(lblAboutMgrStatus);
+
+            // ── 运行环境区 ──
+            SectionLabel lEnv = new SectionLabel();
+            lEnv.Caption = "运行环境";
+            lEnv.Location = new Point((int)Ui.P(34), (int)Ui.P(246));
+            lEnv.Size = new Size((int)Ui.P(200), (int)Ui.P(20));
+            page.Controls.Add(lEnv);
+
+            lblEnvInfo = new Label();
+            lblEnvInfo.BackColor = Color.Transparent;
+            lblEnvInfo.ForeColor = Theme.Current.TextMuted;
+            lblEnvInfo.Font = new Font("Consolas", 9f);
+            lblEnvInfo.Location = new Point((int)Ui.P(34), (int)Ui.P(272));
+            lblEnvInfo.Size = new Size((int)Ui.P(560), (int)Ui.P(64));
+            page.Controls.Add(lblEnvInfo);
+
+            PillButton btnLogOpen = new PillButton();
+            btnLogOpen.Kind = PillButton.Variant.Ghost;
+            btnLogOpen.Label = "打开日志目录";
+            btnLogOpen.Size = new Size((int)Ui.P(110), (int)Ui.P(28));
+            btnLogOpen.Click += delegate
+            {
+                try
+                {
+                    if (!Directory.Exists(Settings.LogsDir)) Directory.CreateDirectory(Settings.LogsDir);
+                    Process.Start("explorer.exe", "\"" + Settings.LogsDir + "\"");
+                }
+                catch { }
+            };
+            page.Controls.Add(btnLogOpen);
+
+            // ── 链接行 ──
+            int ly = (int)Ui.P(362);
+            PillButton btnDoc = LinkButton(page, "DeepSeek Harness 文档", "https://www.npmjs.com/package/@deepseek-ai/dsh", ly);
+            PillButton btnRepo = LinkButton(page, "GitHub 仓库", "https://github.com/wuxingyuyouxing/DeepSeek-Harness-Manager", ly);
+            PillButton btnRel = LinkButton(page, "更新记录", "https://github.com/wuxingyuyouxing/DeepSeek-Harness-Manager/releases", ly);
+            btnDoc.Location = new Point((int)Ui.P(20), ly);
+            btnRepo.Location = new Point((int)Ui.P(208), ly); // 按钮宽176 + 12px 间距
+            btnRel.Location = new Point((int)Ui.P(396), ly);
+
+            // 版权
+            SectionLabel copy = new SectionLabel();
+            copy.Caption = "Copyright © 2026 DeepSeek Harness · MIT License";
+            copy.Faint = true;
+            copy.Semibold = false;
+            copy.FontSize = 8.5f;
+            copy.Location = new Point((int)Ui.P(20), ly + (int)Ui.P(52));
+            copy.Size = new Size((int)Ui.P(400), (int)Ui.P(18));
+            page.Controls.Add(copy);
+
+            SectionLabel tm = new SectionLabel();
+            tm.Caption = "鲸鱼 Logo 为 DeepSeek 商标，仅用于标识本工具管理的目标产品";
+            tm.Faint = true;
+            tm.Semibold = false;
+            tm.FontSize = 8f;
+            tm.Location = new Point((int)Ui.P(20), ly + (int)Ui.P(70));
+            tm.Size = new Size((int)Ui.P(500), (int)Ui.P(18));
+            page.Controls.Add(tm);
+
+            // 分组圆角边框（只描边不填充：控件背景与页面一致，无底纹）
+            page.Paint += delegate(object s, PaintEventArgs e)
+            {
+                Theme T = Theme.Current;
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                RectangleF rc1 = new RectangleF((int)Ui.P(14), (int)Ui.P(78), page.Width - (int)Ui.P(28), (int)Ui.P(150));
+                using (Pen p = new Pen(T.Border)) Draw.StrokeRound(e.Graphics, p, rc1, Ui.P(10));
+                RectangleF rc2 = new RectangleF((int)Ui.P(14), (int)Ui.P(236), page.Width - (int)Ui.P(28), (int)Ui.P(112));
+                using (Pen p = new Pen(T.Border)) Draw.StrokeRound(e.Graphics, p, rc2, Ui.P(10));
+            };
+
+            // 按钮右对齐 + 动态宽度跟随
+            page.Resize += delegate
+            {
+                int bx = page.Width - (int)Ui.P(28) - btnDshCheck.Width;
+                btnDshCheck.Location = new Point(bx, (int)Ui.P(114));
+                btnDshUpgrade.Location = new Point(bx - (int)Ui.P(8) - btnDshUpgrade.Width, (int)Ui.P(114));
+                int bx2 = page.Width - (int)Ui.P(28) - btnMgrCheck.Width;
+                btnMgrCheck.Location = new Point(bx2, (int)Ui.P(174));
+                btnMgrUpdate.Location = new Point(bx2 - (int)Ui.P(8) - btnMgrUpdate.Width, (int)Ui.P(174));
+                lblAboutDshStatus.Width = page.Width - (int)Ui.P(68);
+                lblAboutMgrStatus.Width = page.Width - (int)Ui.P(68);
+                lblEnvInfo.Width = page.Width - (int)Ui.P(198); // 收窄，给右侧按钮留位
+                btnLogOpen.Location = new Point(page.Width - (int)Ui.P(28) - (int)Ui.P(20) - btnLogOpen.Width, (int)Ui.P(300));
+            };
+
+            RefreshAbout();
+            return page;
+        }
+
+        PillButton LinkButton(Control page, string label, string url, int y)
+        {
+            PillButton b = new PillButton();
+            b.Kind = PillButton.Variant.Ghost;
+            b.Label = label;
+            b.Size = new Size((int)Ui.P(176), (int)Ui.P(30)); // 加宽：长文案（如"DeepSeek Harness 文档"）不被裁剪
+            b.Click += delegate { try { Process.Start(url); } catch { } };
+            page.Controls.Add(b);
+            return b;
+        }
+
+        // 刷新关于页：版本显示 / 检查状态 / 环境信息
+        void RefreshAbout()
+        {
+            if (lblAboutDshVer == null) return;
+            Theme T = Theme.Current;
+            string localDsh = DshService.DshVersion.Length > 0 ? DshService.DshVersion : "未知";
+            lblAboutDshVer.Caption = localDsh;
+            lblAboutDshVer.Invalidate();
+            if (UpdateService.DshLatest.Length > 0)
+            {
+                if (localDsh != "未知" && UpdateService.CompareVersions(UpdateService.DshLatest, localDsh) > 0)
+                {
+                    lblAboutDshStatus.Caption = "发现新版本 " + UpdateService.DshLatest + "（当前 " + localDsh + "）→ 点击「一键升级 dsh」";
+                    lblAboutDshStatus.CustomColor = T.Warn;
+                }
+                else
+                {
+                    lblAboutDshStatus.Caption = "已是最新版本 " + localDsh;
+                    lblAboutDshStatus.CustomColor = Color.Empty;
+                }
+            }
+            else
+            {
+                lblAboutDshStatus.Caption = UpdateService.Checked ? "检查失败（可能离线）" : "尚未检查";
+                lblAboutDshStatus.CustomColor = Color.Empty;
+            }
+            lblAboutDshStatus.Invalidate();
+
+            string cur = Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
+            lblAboutMgrVer.Caption = "v" + cur;
+            lblAboutMgrVer.Invalidate();
+            if (UpdateService.ManagerLatest.Length > 0)
+            {
+                if (UpdateService.CompareVersions(UpdateService.ManagerLatest, cur) > 0)
+                {
+                    lblAboutMgrStatus.Caption = "发现新版本 v" + UpdateService.ManagerLatest + " → 点击「下载并更新」";
+                    lblAboutMgrStatus.CustomColor = T.Warn;
+                    btnMgrUpdate.Enabled = true;
+                }
+                else
+                {
+                    lblAboutMgrStatus.Caption = "已是最新版本";
+                    lblAboutMgrStatus.CustomColor = Color.Empty;
+                    btnMgrUpdate.Enabled = false;
+                }
+            }
+            else
+            {
+                lblAboutMgrStatus.Caption = UpdateService.Checked ? "检查失败（可能离线）" : "尚未检查";
+                lblAboutMgrStatus.CustomColor = Color.Empty;
+                btnMgrUpdate.Enabled = false;
+            }
+            lblAboutMgrStatus.Invalidate();
+
+            // 运行环境
+            string home = Environment.GetEnvironmentVariable("DSH_HOME");
+            bool homeExplicit = !string.IsNullOrEmpty(home);
+            if (!homeExplicit) home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
+            lblEnvInfo.Text = "node " + (DshService.NodeVersion.Length > 0 ? DshService.NodeVersion : "未知")
+                + "    dsh " + (localDsh != "未知" ? localDsh : "未知")
+                + "    DSH_HOME: " + home + (homeExplicit ? "" : "（默认）") + "\n"
+                + "应用目录: " + Settings.AppDir + "\n"
+                + "日志目录: " + Settings.LogsDir;
+
+            // 一键升级可用性：仅 npx 缓存安装的 dsh 可自动升级
+            btnDshUpgrade.Enabled = DshNpxManaged();
+            btnDshUpgrade.Invalidate();
+        }
+
+        // dsh 是否由 npx 缓存管理（可一键升级）；手动指定/源码仓库路径则不可
+        static bool DshNpxManaged()
+        {
+            if (Settings.Data.DshPath.Length > 0) return false;
+            string auto = Settings.Data.AutoDshPath;
+            if (auto.Length > 0 && auto.IndexOf("_npx", StringComparison.OrdinalIgnoreCase) < 0) return false;
+            return true;
+        }
+
+        // 手动检查 dsh + 管理器更新
+        void CheckUpdates()
+        {
+            if (aboutBusy) return;
+            aboutBusy = true;
+            if (lblAboutDshStatus != null) { lblAboutDshStatus.Caption = "正在检查…"; lblAboutDshStatus.CustomColor = Color.Empty; lblAboutDshStatus.Invalidate(); }
+            if (lblAboutMgrStatus != null) { lblAboutMgrStatus.Caption = "正在检查…"; lblAboutMgrStatus.CustomColor = Color.Empty; lblAboutMgrStatus.Invalidate(); }
+            UpdateService.CheckAllAsync(delegate
+            {
+                SafeInvoke(delegate { aboutBusy = false; RefreshAbout(); });
+            });
+        }
+
+        // 启动时静默检查一次：有更新弹托盘气泡
+        void AutoCheckUpdates()
+        {
+            UpdateService.CheckAllAsync(delegate
+            {
+                SafeInvoke(delegate
+                {
+                    RefreshAbout();
+                    string msg = "";
+                    string localDsh = DshService.DshVersion;
+                    if (UpdateService.DshLatest.Length > 0 && localDsh.Length > 0 &&
+                        UpdateService.CompareVersions(UpdateService.DshLatest, localDsh) > 0)
+                        msg = "dsh 新版本 " + UpdateService.DshLatest + " 可用";
+                    string cur = Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
+                    if (UpdateService.ManagerLatest.Length > 0 && UpdateService.CompareVersions(UpdateService.ManagerLatest, cur) > 0)
+                        msg = (msg.Length > 0 ? msg + "；" : "") + "管理器新版本 v" + UpdateService.ManagerLatest + " 可用";
+                    if (msg.Length > 0)
+                    {
+                        try { tray.ShowBalloonTip(5000, "发现更新", msg + "\n到「关于」页查看详情。", ToolTipIcon.Info); } catch { }
+                    }
+                });
+            });
+        }
+
+        // 一键升级 dsh：仅 npx 缓存场景，复用 InstallDsh 完整流程
+        void UpgradeDsh(PillButton btn)
+        {
+            if (!DshNpxManaged())
+            {
+                MessageBox.Show(this, "当前 dsh 来自手动指定/自定义路径，无法一键升级。\n请到「诊断」页查看 dsh 入口路径并自行更新。", "一键升级", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            InstallDsh(btn, "一键升级 dsh");
+        }
+
+        // 管理器半自动自更新：下载便携包 → 校验 → 解压 → update.bat 替换 → 自动重启
+        void UpdateManager(PillButton btn)
+        {
+            if (aboutBusy) return;
+            if (UpdateService.ManagerLatestUrl.Length == 0)
+            {
+                CheckUpdates();
+                MessageBox.Show(this, "正在检查更新，请稍后在「关于」页查看结果。", "更新管理器", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            string cur = Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
+            if (UpdateService.ManagerLatest.Length == 0 || UpdateService.CompareVersions(UpdateService.ManagerLatest, cur) <= 0)
+            {
+                MessageBox.Show(this, "当前已是最新版本。", "更新管理器", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            // 安装版：不自动替换（避免破坏安装器/卸载入口），引导走 Setup 升级
+            if (IsInstalledVersion())
+            {
+                MessageBox.Show(this, "检测到当前为安装版安装。为避免破坏安装器与卸载功能，请下载 Setup 安装包重新运行安装向导完成升级（配置与日志会保留）。\n\n即将打开下载页…",
+                    "更新管理器", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                OpenUrl("https://github.com/wuxingyuyouxing/DeepSeek-Harness-Manager/releases/latest");
+                return;
+            }
+            if (MessageBox.Show(this, "发现新版本 v" + UpdateService.ManagerLatest + "。\n将下载便携包（约 36MB）并替换当前程序，完成后自动重启管理器。\n\n继续吗？",
+                "更新管理器", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+            aboutBusy = true;
+            btn.Label = "下载中 0%";
+            btn.Enabled = false;
+            btn.Invalidate();
+
+            string exeDir = Path.GetDirectoryName(Application.ExecutablePath);
+            string tmpDir = Path.Combine(exeDir, ".update-tmp");
+            try { if (Directory.Exists(tmpDir)) Directory.Delete(tmpDir, true); } catch { }
+            try { Directory.CreateDirectory(tmpDir); } catch { }
+            string zipPath = Path.Combine(tmpDir, "manager.zip");
+            string newExe = Path.Combine(tmpDir, "DeepSeek-Harness-Manager.exe");
+
+            WebClient wc = new WebClient();
+            wc.DownloadProgressChanged += delegate(object s, DownloadProgressChangedEventArgs e)
+            {
+                SafeInvoke(delegate { btn.Label = "下载中 " + e.ProgressPercentage + "%"; btn.Invalidate(); });
+            };
+            wc.DownloadFileCompleted += delegate(object s, System.ComponentModel.AsyncCompletedEventArgs e)
+            {
+                if (e.Error != null)
+                {
+                    try { wc.Dispose(); } catch { }
+                    SafeInvoke(delegate { FinishUpdateUi(btn, false, "下载失败：" + e.Error.Message); });
+                    return;
+                }
+                // 校验(可能联网) + 解压放后台线程，避免卡 UI
+                Task.Run(delegate
+                {
+                    string err = VerifyAndExtract(zipPath, newExe, tmpDir);
+                    SafeInvoke(delegate
+                    {
+                        try { wc.Dispose(); } catch { }
+                        if (err.Length > 0) { FinishUpdateUi(btn, false, err); return; }
+                        // 生成 update.bat 并启动，然后退出主程序（bat 等进程退出后替换并重启）
+                        WriteUpdateBat(tmpDir, newExe);
+                        btn.Label = "更新就绪，即将重启…";
+                        btn.Invalidate();
+                        try
+                        {
+                            Process.Start(new ProcessStartInfo("cmd.exe", "/c \"" + Path.Combine(tmpDir, "update.bat") + "\"")
+                            { UseShellExecute = false, CreateNoWindow = true });
+                        }
+                        catch { }
+                        ReallyExit();
+                    });
+                });
+            };
+            try { wc.DownloadFileAsync(new Uri(UpdateService.ManagerLatestUrl), zipPath); }
+            catch (Exception ex) { FinishUpdateUi(btn, false, "无法开始下载：" + ex.Message); }
+        }
+
+        // 下载/更新结束后的按钮与状态复位；err 为空表示成功进入重启
+        void FinishUpdateUi(PillButton btn, bool ok, string err)
+        {
+            aboutBusy = false;
+            btn.Enabled = true;
+            btn.Label = "下载并更新";
+            btn.Invalidate();
+            if (err.Length > 0)
+            {
+                if (lblAboutMgrStatus != null) { lblAboutMgrStatus.Caption = err; lblAboutMgrStatus.Invalidate(); }
+                MessageBox.Show(this, err, "更新管理器", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        // 校验下载的 zip（有 checksums.txt 时比对 SHA-256）并解压出主程序
+        static string VerifyAndExtract(string zipPath, string newExe, string tmpDir)
+        {
+            if (UpdateService.ManagerChecksumsUrl.Length > 0)
+            {
+                string cs = UpdateService.HttpGet(UpdateService.ManagerChecksumsUrl);
+                string hash = Sha256(zipPath);
+                if (cs.Length > 0 && hash.Length > 0 && cs.IndexOf(hash, StringComparison.OrdinalIgnoreCase) < 0)
+                    return "下载文件校验失败（SHA-256 不匹配），已取消更新。";
+            }
+            try
+            {
+                using (FileStream fs = File.OpenRead(zipPath))
+                using (System.IO.Compression.ZipArchive za = new System.IO.Compression.ZipArchive(fs, System.IO.Compression.ZipArchiveMode.Read))
+                {
+                    System.IO.Compression.ZipArchiveEntry entry = null;
+                    foreach (System.IO.Compression.ZipArchiveEntry en in za.Entries)
+                        if (en.FullName.Equals("DeepSeek-Harness-Manager.exe", StringComparison.OrdinalIgnoreCase)) { entry = en; break; }
+                    if (entry == null) return "便携包中未找到主程序，已取消更新。";
+                    using (Stream es = entry.Open())
+                    using (FileStream ofs = new FileStream(newExe, FileMode.Create, FileAccess.Write))
+                        es.CopyTo(ofs);
+                }
+            }
+            catch (Exception ex) { return "解压失败：" + ex.Message; }
+            return "";
+        }
+
+        // 生成 update.bat：等主进程退出 → copy 覆盖 exe → 启动新 exe → 清理临时目录。
+        // 不先 del：copy 失败（杀软锁定/磁盘满）时旧 exe 仍在，可继续运行，绝不"静默卸载"。
+        static void WriteUpdateBat(string tmpDir, string newExe)
+        {
+            string exe = Application.ExecutablePath;
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("@echo off");
+            sb.AppendLine(":loop");
+            sb.AppendLine("tasklist /fi \"imagename eq DeepSeek-Harness-Manager.exe\" 2>nul | find /i \"DeepSeek-Harness-Manager.exe\" >nul");
+            sb.AppendLine("if %errorlevel%==0 (");
+            sb.AppendLine("  timeout /t 1 /nobreak >nul");
+            sb.AppendLine("  goto loop");
+            sb.AppendLine(")");
+            sb.AppendLine("copy /y \"" + newExe + "\" \"" + exe + "\" >nul");
+            sb.AppendLine("if %errorlevel%==0 (");
+            sb.AppendLine("  start \"\" \"" + exe + "\"");
+            sb.AppendLine(") else (");
+            sb.AppendLine("  echo update copy failed at %date% %time% > \"" + Path.Combine(tmpDir, "update-error.log") + "\"");
+            sb.AppendLine("  start \"\" \"" + exe + "\"");
+            sb.AppendLine(")");
+            sb.AppendLine("rd /s /q \"" + tmpDir + "\"");
+            // bat 需与系统代码页一致才能正确解析中文路径
+            File.WriteAllText(Path.Combine(tmpDir, "update.bat"), sb.ToString(), Encoding.Default);
+        }
+
+        static string Sha256(string file)
+        {
+            try
+            {
+                using (FileStream fs = File.OpenRead(file))
+                using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+                    return BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "").ToLowerInvariant();
+            }
+            catch { return ""; }
+        }
+
+        // 当前是否安装版安装（注册表有安装记录且 exe 位于安装目录）
+        static bool IsInstalledVersion()
+        {
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\DeepSeekHarnessManager"))
+                {
+                    if (k == null) return false;
+                    string loc = (string)k.GetValue("InstallLocation") ?? "";
+                    return loc.Length > 0 && Application.ExecutablePath.StartsWith(loc, StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            catch { return false; }
+        }
+
+        static void OpenUrl(string url)
+        {
+            try { Process.Start(url); } catch { }
+        }
+
+        // 通过 npx 安装/升级 dsh CLI（后台执行，输出实时流式显示在诊断框，按钮显示已用秒数）
+        // doneLabel：完成/失败后按钮恢复的文案（诊断页"一键安装 dsh"，关于页"一键升级 dsh"）
+        void InstallDsh(PillButton btn, string doneLabel)
         {
             if (DshService.NodeExe.Length == 0) DshService.Resolve();
             if (DshService.NodeExe.Length == 0)
@@ -2778,7 +3450,7 @@ namespace DshManager
                     {
                         try { ticker.Stop(); ticker.Dispose(); } catch { }
                         btn.Enabled = true;
-                        btn.Label = "一键安装 dsh";
+                        btn.Label = doneLabel;
                         btn.Invalidate();
                         installingDsh = false;
                         if (timedOut)

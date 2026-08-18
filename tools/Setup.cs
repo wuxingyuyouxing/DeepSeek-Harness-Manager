@@ -21,8 +21,8 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("DeepSeek Harness Manager")]
 [assembly: AssemblyCompany("DeepSeek Harness")]
 [assembly: AssemblyCopyright("Copyright © 2026 DeepSeek Harness")]
-[assembly: AssemblyVersion("1.1.1.0")]
-[assembly: AssemblyFileVersion("1.1.1.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
 
 namespace SetupApp
 {
@@ -317,7 +317,7 @@ namespace SetupApp
                     k.SetValue("DisplayIcon", exePath);
                     k.SetValue("InstallLocation", installDir);
                     k.SetValue("UninstallString", "\"" + Assembly.GetExecutingAssembly().Location + "\" --uninstall");
-                    k.SetValue("DisplayVersion", "1.1.1");
+                    k.SetValue("DisplayVersion", "1.2.0");
                     k.SetValue("Publisher", "DeepSeek Harness");
                 }
             }

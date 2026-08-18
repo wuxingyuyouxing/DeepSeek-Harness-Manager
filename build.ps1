@@ -31,7 +31,7 @@ if (-not (Test-Path $nodeExe)) {
     /win32icon:"$root\DeepSeek-Harness.ico" `
     /r:System.dll /r:System.Core.dll /r:System.Drawing.dll `
     /r:System.Windows.Forms.dll /r:System.Net.Http.dll /r:System.Web.Extensions.dll `
-    /r:System.Management.dll `
+    /r:System.Management.dll /r:System.IO.Compression.dll `
     "$root\Manager.cs"
 
 if ($LASTEXITCODE -eq 0) {

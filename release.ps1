@@ -53,7 +53,7 @@ if (-not (Test-Path $nodeExe)) {
     Ok '便携 Node 就绪'
 }
 
-# ── 3. 编译主程序 + 签名 ───────────────────────────────────────────────
+# ── 3. 编译主程序 ──────────────────────────────────────────────────────
 Step '编译主程序…'
 # /codepage:65001：源码为 UTF-8 无 BOM，强制按 UTF-8 读取避免中文乱码
 & $csc /nologo /target:winexe /optimize+ /codepage:65001 `
@@ -61,10 +61,22 @@ Step '编译主程序…'
     /win32icon:"$root\DeepSeek-Harness.ico" `
     /r:System.dll /r:System.Core.dll /r:System.Drawing.dll `
     /r:System.Windows.Forms.dll /r:System.Net.Http.dll /r:System.Web.Extensions.dll `
-    /r:System.Management.dll "$root\Manager.cs"
+    /r:System.Management.dll /r:System.IO.Compression.dll "$root\Manager.cs"
 if ($LASTEXITCODE -ne 0) { throw '主程序编译失败' }
 
-# ── 4. 打包便携版 zip ─────────────────────────────────────────────────
+# ── 3.5 签名主程序 exe（必须在打包之前，确保便携包/安装包内 exe 已签名）──
+function Sign-File([string]$path) {
+    $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction SilentlyContinue |
+            Where-Object { $_.Subject -like '*DeepSeek Harness Manager*' } | Select-Object -First 1
+    if (-not $cert) { Warn "未找到签名证书，跳过签名：$path"; return }
+    Set-AuthenticodeSignature -FilePath $path -Certificate $cert -TimestampServer 'http://timestamp.digicert.com' | Out-Null
+    $sig = Get-AuthenticodeSignature $path
+    Ok "$(Split-Path $path -Leaf) 签名: $($sig.SignerCertificate.Subject)"
+}
+Step '签名主程序…'
+Sign-File "$root\DeepSeek-Harness-Manager.exe"
+
+# ── 4. 打包便携版 zip（内含已签名 exe）─────────────────────────────────
 Step '打包便携版…'
 $stage = Join-Path $root 'dist\_stage'
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
@@ -83,7 +95,7 @@ Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $portable -Compre
 Remove-Item $stage -Recurse -Force
 Ok "便携版：$([math]::Round((Get-Item $portable).Length/1MB,1)) MB"
 
-# ── 5. 构建安装版（嵌入 payload）+ 签名 ────────────────────────────────
+# ── 5. 构建安装版（嵌入 payload，内含已签名 exe）───────────────────────
 Step '构建安装版…'
 $tools = Join-Path $root 'tools'
 Copy-Item $portable (Join-Path $tools 'payload.zip') -Force
@@ -101,20 +113,17 @@ $setupFinal = Join-Path $root "dist\DeepSeek-Harness-Manager-Setup-$tag.exe"
 Copy-Item $setupOut $setupFinal -Force
 Ok "安装版：$([math]::Round((Get-Item $setupFinal).Length/1MB,1)) MB"
 
-# ── 6. 签名 + 验证 ────────────────────────────────────────────────────
-Step '签名…'
-$cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction SilentlyContinue |
-        Where-Object { $_.Subject -like '*DeepSeek Harness Manager*' } | Select-Object -First 1
-foreach ($f in @("$root\DeepSeek-Harness-Manager.exe", $setupFinal)) {
-    if ($cert) {
-        Set-AuthenticodeSignature -FilePath $f -Certificate $cert -TimestampServer 'http://timestamp.digicert.com' | Out-Null
-        $sig = Get-AuthenticodeSignature $f
-        Ok "$(Split-Path $f -Leaf) 签名: $($sig.SignerCertificate.Subject)"
-    } else {
-        Warn '未找到签名证书，跳过签名（不影响发布，仅 SmartScreen 提示更明显）'
-        break
-    }
-}
+# ── 6. 签名安装版 ──────────────────────────────────────────────────────
+Step '签名安装版…'
+Sign-File $setupFinal
+
+# ── 6.5 生成 checksums.txt（管理器自更新校验用，覆盖最终产物）──────────
+$checksumsFile = Join-Path $root 'dist\checksums.txt'
+@(
+    (Get-FileHash $portable -Algorithm SHA256).Hash.ToLower() + "  " + (Split-Path $portable -Leaf),
+    (Get-FileHash $setupFinal -Algorithm SHA256).Hash.ToLower() + "  " + (Split-Path $setupFinal -Leaf)
+) | Set-Content $checksumsFile -Encoding ASCII
+Ok "校验文件：$checksumsFile"
 
 if ($DryRun) {
     Write-Host "`n[DryRun] 构建、打包、签名完成。未提交/推送/发布。" -ForegroundColor Yellow
@@ -160,7 +169,7 @@ $headers = @{ Authorization = "token $token"; Accept = 'application/vnd.github.v
 $body = @{ tag_name = $tag; name = $tag; body = $Notes; draft = [bool]$Draft } | ConvertTo-Json
 $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases" -Method Post -Headers $headers -Body $body -ContentType 'application/json'
 
-foreach ($asset in @($portable, $setupFinal)) {
+foreach ($asset in @($portable, $setupFinal, $checksumsFile)) {
     $name = Split-Path $asset -Leaf
     $up = $rel.upload_url -replace '\{\?name,label\}', ("?name=" + [uri]::EscapeDataString($name))
     Invoke-WebRequest -Uri $up -Method Post -Headers $headers -InFile $asset -ContentType 'application/octet-stream' -TimeoutSec 600 | Out-Null
