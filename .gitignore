@@ -21,3 +21,8 @@ tools/DeepSeek-Harness.ico
 .vs/
 *.user
 Thumbs.db
+
+# DSH 插件开发内容（本机工作区，不属于管理器项目，不入库）
+plugins/
+.bin/
+node_modules/
