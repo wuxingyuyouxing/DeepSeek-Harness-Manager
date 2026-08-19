@@ -1,0 +1,14 @@
+# orca-link skin bundle patch — intentionally EMPTY for this install.
+#
+# The skin entry is registered from the web profile's user layer
+# (C:\Users\X\.dsh\profiles\web\cordis.patch.yml) so it hot-loads into the
+# running GUI without a restart. Keeping this bundle patch empty prevents the
+# same entry id (ui-skin-orca-link) from being inserted twice at the next
+# boot — a duplicate loader entry id is fatal (EntryTree.update throws).
+# Skin switching is managed via the profile + home patch layers' disabled rows.
+#
+# Upstream content (for reference):
+#   - insert:
+#       - id: ui-skin-orca-link
+#         name: '@dsh-external/dsh-client-ui-skin-orca-link'
+[]

@@ -29,8 +29,8 @@ using Timer = System.Windows.Forms.Timer;
 [assembly: AssemblyProduct("DeepSeek Harness Manager")]
 [assembly: AssemblyCompany("DeepSeek Harness")]
 [assembly: AssemblyCopyright("Copyright © 2026 DeepSeek Harness")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.2.1.0")]
+[assembly: AssemblyFileVersion("1.2.1.0")]
 
 namespace DshManager
 {
@@ -821,6 +821,17 @@ namespace DshManager
                 }
             }
             catch { return false; }
+        }
+
+        // DSH 0.1.0-rc 系列出于安全限制拒绝 --host 0.0.0.0（防远程代码执行），不支持局域网绑定：
+        //   dsh-web-app 的 startup.js 硬性报错"intentionally not supported yet for safety"，
+        //   且 webserver 配置 schema 只允许 "127.0.0.1" | "0.0.0.0"。
+        // 版本未知时保守按"不支持"。DSH 未来版本若放开 0.0.0.0，此判断需相应更新。
+        public static bool SupportsLan()
+        {
+            string v = DshVersion;
+            if (v.Length == 0) return false;
+            return !v.StartsWith("0.1.0-rc", StringComparison.OrdinalIgnoreCase);
         }
 
         public static SvcState Detect(InstanceRuntime rt)
@@ -3160,8 +3171,17 @@ namespace DshManager
                 + "应用目录: " + Settings.AppDir + "\n"
                 + "日志目录: " + Settings.LogsDir;
 
-            // 一键升级可用性：仅 npx 缓存安装的 dsh 可自动升级
-            btnDshUpgrade.Enabled = DshNpxManaged();
+            // 一键升级可用性：npx 缓存安装 且 确实发现新版才可点；
+            // 已是最新 / 检查失败 / 版本未知 → 禁用（避免白跑一次 npx 重装）
+            bool canUpgrade = DshNpxManaged();
+            if (canUpgrade)
+            {
+                if (UpdateService.DshLatest.Length > 0 && localDsh != "未知")
+                    canUpgrade = UpdateService.CompareVersions(UpdateService.DshLatest, localDsh) > 0;
+                else
+                    canUpgrade = false; // 未查到新版/检查失败/本地版本未知：不给升级
+            }
+            btnDshUpgrade.Enabled = canUpgrade;
             btnDshUpgrade.Invalidate();
         }
 
@@ -3217,6 +3237,14 @@ namespace DshManager
             if (!DshNpxManaged())
             {
                 MessageBox.Show(this, "当前 dsh 来自手动指定/自定义路径，无法一键升级。\n请到「诊断」页查看 dsh 入口路径并自行更新。", "一键升级", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            // 兜底：已是最新时不白跑 npx
+            string localDsh = DshService.DshVersion;
+            if (UpdateService.DshLatest.Length > 0 && localDsh.Length > 0 &&
+                UpdateService.CompareVersions(UpdateService.DshLatest, localDsh) <= 0)
+            {
+                MessageBox.Show(this, "dsh 已是最新版本（" + localDsh + "），无需升级。", "一键升级", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             InstallDsh(btn, "一键升级 dsh");
@@ -3497,7 +3525,18 @@ namespace DshManager
             {
                 AppendDiag("启动命令", Theme.Current.Accent);
                 AppendDiag("  dsh web --host " + selected.Cfg.Host + " --port " + selected.Cfg.Port, Theme.Current.LogText);
-                AppendDiag("  局域网访问：dsh web --host 0.0.0.0 --port " + selected.Cfg.Port + " --trusted-host <设备IP>", Theme.Current.LogText);
+                if (DshService.SupportsLan())
+                {
+                    AppendDiag("  局域网访问：dsh web --host 0.0.0.0 --port " + selected.Cfg.Port + " --trusted-host <本机IP>", Theme.Current.LogText);
+                }
+                else
+                {
+                    AppendDiag("  局域网访问：暂不可用", Theme.Current.LogErr);
+                    AppendDiag("    DSH " + (DshService.DshVersion.Length > 0 ? DshService.DshVersion : "当前版本") + " 出于安全限制（防远程代码执行）拒绝 --host 0.0.0.0，", Theme.Current.LogText);
+                    AppendDiag("    服务只能监听 127.0.0.1，其他设备无法访问。", Theme.Current.LogText);
+                    AppendDiag("    请关注 DSH 后续版本是否放开 0.0.0.0 绑定；", Theme.Current.LogText);
+                    AppendDiag("    如需局域网使用，可用反向代理将 127.0.0.1:" + selected.Cfg.Port + " 暴露到局域网。", Theme.Current.LogText);
+                }
             }
         }
 
@@ -3633,27 +3672,38 @@ namespace DshManager
             }
             if (stLan != null)
             {
-                List<string> ips = new List<string>();
-                try
+                if (!DshService.SupportsLan())
                 {
-                    IPAddress[] adds = Dns.GetHostEntry(Dns.GetHostName()).AddressList;
-                    foreach (IPAddress a in adds)
-                    {
-                        if (a.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(a)) ips.Add(a.ToString());
-                    }
-                }
-                catch { }
-                if (ips.Count > 0)
-                {
-                    stLan.Value = "http://" + ips[0] + ":" + selected.Cfg.Port;
-                    stLan.Sub = "局域网地址（如有多张网卡见诊断页）· 跨设备需 --trusted-host";
+                    // DSH 0.1.0-rc 系列安全限制：拒绝 --host 0.0.0.0，局域网绑定不可用
+                    stLan.Value = "仅本机可访问";
+                    stLan.Sub = "DSH " + (DshService.DshVersion.Length > 0 ? DshService.DshVersion : "当前版本")
+                        + " 出于安全限制暂不支持局域网绑定（--host 0.0.0.0 被拒绝），详见「诊断」页";
+                    stLan.Invalidate();
                 }
                 else
                 {
-                    stLan.Value = "仅本机可访问";
-                    stLan.Sub = "未检测到局域网地址";
+                    List<string> ips = new List<string>();
+                    try
+                    {
+                        IPAddress[] adds = Dns.GetHostEntry(Dns.GetHostName()).AddressList;
+                        foreach (IPAddress a in adds)
+                        {
+                            if (a.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(a)) ips.Add(a.ToString());
+                        }
+                    }
+                    catch { }
+                    if (ips.Count > 0)
+                    {
+                        stLan.Value = "http://" + ips[0] + ":" + selected.Cfg.Port;
+                        stLan.Sub = "局域网地址（如有多张网卡见诊断页）· 跨设备需 --trusted-host";
+                    }
+                    else
+                    {
+                        stLan.Value = "仅本机可访问";
+                        stLan.Sub = "未检测到局域网地址";
+                    }
+                    stLan.Invalidate();
                 }
-                stLan.Invalidate();
             }
             if (stEnv != null)
             {
