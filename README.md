@@ -67,8 +67,8 @@ DeepSeek-Harness-Manager.exe --cli stop  --port 3099
 
 | 文件 | 说明 |
 | --- | --- |
-| `DeepSeek-Harness-Manager-Setup-v1.2.0.exe` | **安装版**（35MB 单文件，类似 QQ/微信）：安装/升级向导、桌面/开始菜单快捷方式、卸载入口；已装用户重跑自动匹配原目录并升级 |
-| `DeepSeek-Harness-Manager-Portable-v1.2.0.zip` | **便携免安装版**：解压即用（含自带 Node），无需安装 |
+| `DeepSeek-Harness-Manager-Setup-v1.2.1.exe` | **安装版**（35MB 单文件，类似 QQ/微信）：安装/升级向导、桌面/开始菜单快捷方式、卸载入口；已装用户重跑自动匹配原目录并升级 |
+| `DeepSeek-Harness-Manager-Portable-v1.2.1.zip` | **便携免安装版**：解压即用（含自带 Node），无需安装 |
 | `数字签名说明.md` | 签名状态与正式签名指南 |
 | `CHANGELOG.md` | 版本更新记录 |
 
