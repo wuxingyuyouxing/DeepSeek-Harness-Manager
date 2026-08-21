@@ -21,8 +21,8 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("DeepSeek Harness Manager")]
 [assembly: AssemblyCompany("DeepSeek Harness")]
 [assembly: AssemblyCopyright("Copyright © 2026 DeepSeek Harness")]
-[assembly: AssemblyVersion("1.2.1.0")]
-[assembly: AssemblyFileVersion("1.2.1.0")]
+[assembly: AssemblyVersion("1.2.2.0")]
+[assembly: AssemblyFileVersion("1.2.2.0")]
 
 namespace SetupApp
 {

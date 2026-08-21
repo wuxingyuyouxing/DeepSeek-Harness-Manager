@@ -29,8 +29,8 @@ using Timer = System.Windows.Forms.Timer;
 [assembly: AssemblyProduct("DeepSeek Harness Manager")]
 [assembly: AssemblyCompany("DeepSeek Harness")]
 [assembly: AssemblyCopyright("Copyright © 2026 DeepSeek Harness")]
-[assembly: AssemblyVersion("1.2.1.0")]
-[assembly: AssemblyFileVersion("1.2.1.0")]
+[assembly: AssemblyVersion("1.2.2.0")]
+[assembly: AssemblyFileVersion("1.2.2.0")]
 
 namespace DshManager
 {
@@ -526,7 +526,30 @@ namespace DshManager
                     string bin = Path.GetFullPath(Path.Combine(d, "..", "@deepseek-ai", "dsh", "lib", "bin.js"));
                     if (File.Exists(bin)) return bin;
                 }
-                // 3. npx 缓存
+            }
+            catch { }
+            // 3. npm 全局安装目录（npm root -g 探测）——常驻安装，清理 npm 缓存不受影响，无需用户配 PATH
+            try
+            {
+                string node = FindNodeExe();
+                if (node.Length > 0)
+                {
+                    string npm = Path.Combine(Path.GetDirectoryName(node), "npm.cmd");
+                    if (File.Exists(npm))
+                    {
+                        string globalRoot = RunCapture(npm, "root -g").Trim();
+                        if (globalRoot.Length > 0)
+                        {
+                            string bin = Path.Combine(globalRoot, "@deepseek-ai", "dsh", "lib", "bin.js");
+                            if (File.Exists(bin)) return bin;
+                        }
+                    }
+                }
+            }
+            catch { }
+            // 4. npx 缓存（旧版安装布局，向后兼容）
+            try
+            {
                 string local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "npm-cache", "_npx");
                 if (Directory.Exists(local))
                 {
@@ -958,7 +981,8 @@ namespace DshManager
     // 版本比较用数字段 semver（支持 0.1.0-rc.7 / 1.1.1.0，rc.9 vs rc.10 不会比错）。
     static class UpdateService
     {
-        public static string DshLatest = "";        // npm 最新 dsh 版本（""=未查到）
+        public static string DshLatest = "";        // npm latest 标签版本（默认升级轨，稳定/推荐版，""=未查到）
+        public static string DshNext = "";          // npm next 标签版本（可选预览轨，含破坏性变更，仅当高于 latest 时非空）
         public static string ManagerLatest = "";    // GitHub 最新管理器版本，无 v 前缀
         public static string ManagerLatestUrl = ""; // 便携包 zip 下载地址
         public static string ManagerChecksumsUrl = ""; // checksums.txt 资产地址（可能为空）
@@ -1025,19 +1049,53 @@ namespace DshManager
             return 0;
         }
 
-        // ── 查 dsh 最新版本（npm registry，公开接口）──
+        // ── 查 dsh 版本（npm registry，公开接口）──
+        // 双轨检测：@deepseek-ai/dsh 只发布 0.1.0-rc.x 预发布版本，官方把推荐版挂在 latest 标签、
+        // 预览版挂在 next 标签（实测 rc.8=next、rc.7=latest）。默认升级只跟随 latest（稳定轨），
+        // next（预览轨）作为"可选更新"，由用户自行决定是否冒险升级。
+        // 因此读取完整 packument：DshLatest=latest 标签版本（缺失时取全部版本最高者），
+        // DshNext=next 标签版本（仅当确实高于 latest 时才视为可选预览版）。
+        // 返回 DshLatest，供既有调用兼容。
         public static string CheckDsh()
         {
-            string body = HttpGet("https://registry.npmjs.org/@deepseek-ai/dsh/latest");
-            if (body.Length == 0) return "";
+            string body = HttpGet("https://registry.npmjs.org/@deepseek-ai/dsh");
+            if (body.Length == 0) { DshLatest = ""; DshNext = ""; return ""; }
             try
             {
                 // JavaScriptSerializer 非线程安全，检测可能在后台线程并发调用，每次新建
                 Dictionary<string, object> d = new JavaScriptSerializer().DeserializeObject(body) as Dictionary<string, object>;
-                if (d != null && d.ContainsKey("version")) return d["version"].ToString();
+                if (d == null) { DshLatest = ""; DshNext = ""; return ""; }
+                string latest = "", next = "";
+                object tagsObj;
+                if (d.TryGetValue("dist-tags", out tagsObj))
+                {
+                    Dictionary<string, object> tags = tagsObj as Dictionary<string, object>;
+                    if (tags != null)
+                    {
+                        object v;
+                        if (tags.TryGetValue("latest", out v) && v != null) latest = v.ToString().Trim();
+                        if (tags.TryGetValue("next", out v) && v != null) next = v.ToString().Trim();
+                    }
+                }
+                // 兜底：latest 标签缺失/为空时，取全部已发布版本中语义版本最高者
+                if (latest.Length == 0)
+                {
+                    object verObj;
+                    if (d.TryGetValue("versions", out verObj))
+                    {
+                        Dictionary<string, object> versions = verObj as Dictionary<string, object>;
+                        if (versions != null)
+                            foreach (string v in versions.Keys)
+                                if (latest.Length == 0 || CompareVersions(v, latest) > 0) latest = v;
+                    }
+                }
+                // next 只有确实高于 latest 才作为"可选预览版"；否则视为没有预览更新
+                if (next.Length > 0 && latest.Length > 0 && CompareVersions(next, latest) <= 0) next = "";
+                DshLatest = latest;
+                DshNext = next;
+                return latest;
             }
-            catch { }
-            return "";
+            catch { DshLatest = ""; DshNext = ""; return ""; }
         }
 
         // ── 查管理器最新版本（GitHub Releases，公开接口）──
@@ -1868,7 +1926,7 @@ namespace DshManager
 
         // 关于页
         SectionLabel lblAboutDshVer, lblAboutDshStatus, lblAboutMgrVer, lblAboutMgrStatus;
-        PillButton btnDshCheck, btnDshUpgrade, btnMgrCheck, btnMgrUpdate;
+        PillButton btnDshCheck, btnDshUpgrade, btnDshNext, btnMgrCheck, btnMgrUpdate;
         Label lblEnvInfo;
         bool aboutBusy; // 更新检查/下载进行中
 
@@ -2786,7 +2844,7 @@ namespace DshManager
             btnInstall.Label = "一键安装 dsh";
             btnInstall.Location = new Point((int)Ui.P(242), (int)Ui.P(7));
             btnInstall.Size = new Size((int)Ui.P(116), (int)Ui.P(32));
-            btnInstall.Click += delegate { InstallDsh(btnInstall, "一键安装 dsh"); };
+            btnInstall.Click += delegate { InstallDsh(btnInstall, "一键安装 dsh", UpdateService.DshLatest, null); };
             bar.Controls.Add(btnInstall);
 
             // 手动指定 node/dsh 路径（适配源码仓库/自建安装等非标准方式）
@@ -2952,7 +3010,7 @@ namespace DshManager
             btnDshUpgrade.Kind = PillButton.Variant.Primary;
             btnDshUpgrade.Label = "一键升级 dsh";
             btnDshUpgrade.Size = new Size((int)Ui.P(116), (int)Ui.P(30));
-            btnDshUpgrade.Click += delegate { UpgradeDsh(btnDshUpgrade); };
+            btnDshUpgrade.Click += delegate { UpgradeDsh(btnDshUpgrade, UpdateService.DshLatest, "一键升级 dsh"); };
             page.Controls.Add(btnDshUpgrade);
 
             btnDshCheck = new PillButton();
@@ -2961,6 +3019,15 @@ namespace DshManager
             btnDshCheck.Size = new Size((int)Ui.P(88), (int)Ui.P(30));
             btnDshCheck.Click += delegate { CheckUpdates(); };
             page.Controls.Add(btnDshCheck);
+
+            // 「升级到预览版」：next 轨可选升级（含破坏性变更，需用户确认），默认隐藏
+            btnDshNext = new PillButton();
+            btnDshNext.Kind = PillButton.Variant.Ghost;
+            btnDshNext.Label = "升级到预览版";
+            btnDshNext.Size = new Size((int)Ui.P(116), (int)Ui.P(30));
+            btnDshNext.Visible = false;
+            btnDshNext.Click += delegate { UpgradeDsh(btnDshNext, UpdateService.DshNext, "升级到预览版"); };
+            page.Controls.Add(btnDshNext);
 
             lblAboutDshStatus = new SectionLabel();
             lblAboutDshStatus.Faint = true;
@@ -3083,6 +3150,7 @@ namespace DshManager
                 int bx = page.Width - (int)Ui.P(28) - btnDshCheck.Width;
                 btnDshCheck.Location = new Point(bx, (int)Ui.P(114));
                 btnDshUpgrade.Location = new Point(bx - (int)Ui.P(8) - btnDshUpgrade.Width, (int)Ui.P(114));
+                btnDshNext.Location = new Point(btnDshUpgrade.Left - (int)Ui.P(8) - btnDshNext.Width, (int)Ui.P(114));
                 int bx2 = page.Width - (int)Ui.P(28) - btnMgrCheck.Width;
                 btnMgrCheck.Location = new Point(bx2, (int)Ui.P(174));
                 btnMgrUpdate.Location = new Point(bx2 - (int)Ui.P(8) - btnMgrUpdate.Width, (int)Ui.P(174));
@@ -3115,11 +3183,21 @@ namespace DshManager
             string localDsh = DshService.DshVersion.Length > 0 ? DshService.DshVersion : "未知";
             lblAboutDshVer.Caption = localDsh;
             lblAboutDshVer.Invalidate();
+            // 双轨：latest（稳定轨）默认提示；next（预览轨）作为可选更新，明确标注风险
+            bool latestUp = UpdateService.DshLatest.Length > 0 && localDsh != "未知" &&
+                UpdateService.CompareVersions(UpdateService.DshLatest, localDsh) > 0;
+            bool nextUp = UpdateService.DshNext.Length > 0 && localDsh != "未知" &&
+                UpdateService.CompareVersions(UpdateService.DshNext, localDsh) > 0;
             if (UpdateService.DshLatest.Length > 0)
             {
-                if (localDsh != "未知" && UpdateService.CompareVersions(UpdateService.DshLatest, localDsh) > 0)
+                if (latestUp)
                 {
                     lblAboutDshStatus.Caption = "发现新版本 " + UpdateService.DshLatest + "（当前 " + localDsh + "）→ 点击「一键升级 dsh」";
+                    lblAboutDshStatus.CustomColor = T.Warn;
+                }
+                else if (nextUp)
+                {
+                    lblAboutDshStatus.Caption = "已是最新稳定版 " + localDsh + " · 可选预览版 " + UpdateService.DshNext + "（含破坏性变更）";
                     lblAboutDshStatus.CustomColor = T.Warn;
                 }
                 else
@@ -3171,27 +3249,29 @@ namespace DshManager
                 + "应用目录: " + Settings.AppDir + "\n"
                 + "日志目录: " + Settings.LogsDir;
 
-            // 一键升级可用性：npx 缓存安装 且 确实发现新版才可点；
-            // 已是最新 / 检查失败 / 版本未知 → 禁用（避免白跑一次 npx 重装）
-            bool canUpgrade = DshNpxManaged();
-            if (canUpgrade)
-            {
-                if (UpdateService.DshLatest.Length > 0 && localDsh != "未知")
-                    canUpgrade = UpdateService.CompareVersions(UpdateService.DshLatest, localDsh) > 0;
-                else
-                    canUpgrade = false; // 未查到新版/检查失败/本地版本未知：不给升级
-            }
+            // 一键升级可用性：dsh 可升级（npm 全局安装 / npx 缓存安装）且确实发现新版才可点；
+            // 已是最新 / 检查失败 / 版本未知 → 禁用（避免白跑一次安装）
+            bool canUpgrade = DshUpgradeable() && latestUp;
             btnDshUpgrade.Enabled = canUpgrade;
             btnDshUpgrade.Invalidate();
+            // 「升级到预览版」：仅当存在高于本地的 next 预览版时可点
+            bool canNext = DshUpgradeable() && nextUp;
+            btnDshNext.Visible = canNext;
+            btnDshNext.Enabled = canNext;
+            btnDshNext.Invalidate();
         }
 
-        // dsh 是否由 npx 缓存管理（可一键升级）；手动指定/源码仓库路径则不可
-        static bool DshNpxManaged()
+        // dsh 是否可一键升级：按当前生效入口判断——npm 全局安装 或 npx 缓存安装均可
+        // （全局升级用 npm install -g，升级后管理器自动改指到全局路径）；
+        // 源码仓库/自定义等非标准路径则引导手动更新，不做一键升级
+        static bool DshUpgradeable()
         {
-            if (Settings.Data.DshPath.Length > 0) return false;
-            string auto = Settings.Data.AutoDshPath;
-            if (auto.Length > 0 && auto.IndexOf("_npx", StringComparison.OrdinalIgnoreCase) < 0) return false;
-            return true;
+            string bin = DshService.BinJs;
+            if (bin.Length == 0) bin = Settings.Data.AutoDshPath;
+            if (bin.Length == 0) return true; // 尚无路径：允许安装/升级
+            bool npxCache = bin.IndexOf("_npx", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool npmGlobal = bin.IndexOf("\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js", StringComparison.OrdinalIgnoreCase) >= 0;
+            return npxCache || npmGlobal;
         }
 
         // 手动检查 dsh + 管理器更新
@@ -3231,23 +3311,47 @@ namespace DshManager
             });
         }
 
-        // 一键升级 dsh：仅 npx 缓存场景，复用 InstallDsh 完整流程
-        void UpgradeDsh(PillButton btn)
+        // 一键升级 dsh（targetVersion：目标版本；trackLabel：按钮/弹窗文案，如"一键升级 dsh"/"升级到预览版"）
+        // 安全原则：若 dsh 正在运行，先停止（绝不覆盖运行中的文件），升级完成后自动重启。
+        void UpgradeDsh(PillButton btn, string targetVersion, string trackLabel)
         {
-            if (!DshNpxManaged())
+            if (!DshUpgradeable())
             {
-                MessageBox.Show(this, "当前 dsh 来自手动指定/自定义路径，无法一键升级。\n请到「诊断」页查看 dsh 入口路径并自行更新。", "一键升级", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show(this, "当前 dsh 来自手动指定/自定义路径，无法一键升级。\n请到「诊断」页查看 dsh 入口路径并自行更新。", trackLabel, MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            // 兜底：已是最新时不白跑 npx
+            // 兜底：目标版本不高于本地时不白跑安装
             string localDsh = DshService.DshVersion;
-            if (UpdateService.DshLatest.Length > 0 && localDsh.Length > 0 &&
-                UpdateService.CompareVersions(UpdateService.DshLatest, localDsh) <= 0)
+            if (targetVersion.Length > 0 && localDsh.Length > 0 &&
+                UpdateService.CompareVersions(targetVersion, localDsh) <= 0)
             {
-                MessageBox.Show(this, "dsh 已是最新版本（" + localDsh + "），无需升级。", "一键升级", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show(this, "dsh 已是最新版本（" + localDsh + "），无需升级。", trackLabel, MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            InstallDsh(btn, "一键升级 dsh");
+            // 升级会替换 dsh 程序文件：正在运行的实例必须先停止，完成后自动重启
+            List<InstanceRuntime> toRestart = new List<InstanceRuntime>();
+            foreach (InstanceRuntime rt in runtimes)
+            {
+                if (rt.State == SvcState.Running || rt.State == SvcState.Starting)
+                {
+                    if (MessageBox.Show(this,
+                        "检测到 dsh 服务正在运行（PID " + rt.Pid + "）。\n升级将替换 dsh 程序文件，为避免破坏正在运行的服务，会先停止服务，升级完成后自动重启。\n\n继续吗？",
+                        trackLabel, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                        return;
+                    toRestart.Add(rt);
+                    break;
+                }
+            }
+            // 停止前打上 Busy + ManualStopped 标记：阻止看门狗在安装期间把服务自动拉起
+            // （否则会覆盖运行中的文件，造成损坏）；安装完成后由 InstallDsh 清除并自动重启
+            foreach (InstanceRuntime rt in toRestart)
+            {
+                rt.Busy = true;
+                rt.Cfg.ManualStopped = true;
+                DshService.Stop(rt, false);
+            }
+            UpdateSelectedUi();
+            InstallDsh(btn, trackLabel, targetVersion, toRestart);
         }
 
         // 管理器半自动自更新：下载便携包 → 校验 → 解压 → update.bat 替换 → 自动重启
@@ -3426,9 +3530,10 @@ namespace DshManager
             try { Process.Start(url); } catch { }
         }
 
-        // 通过 npx 安装/升级 dsh CLI（后台执行，输出实时流式显示在诊断框，按钮显示已用秒数）
-        // doneLabel：完成/失败后按钮恢复的文案（诊断页"一键安装 dsh"，关于页"一键升级 dsh"）
-        void InstallDsh(PillButton btn, string doneLabel)
+        // 通过 npm 全局安装/升级 dsh CLI（后台执行，输出实时流式显示在诊断框，按钮显示已用秒数）
+        // 全局安装常驻在 npm 全局目录（npm root -g），用户清理 npm 缓存不会把 dsh 清掉。
+        // targetVersion：目标版本号（"" 表示装 npm latest 标签）；toRestart：升级前已停止、完成后需自动重启的实例
+        void InstallDsh(PillButton btn, string doneLabel, string targetVersion, List<InstanceRuntime> toRestart)
         {
             if (DshService.NodeExe.Length == 0) DshService.Resolve();
             if (DshService.NodeExe.Length == 0)
@@ -3441,7 +3546,11 @@ namespace DshManager
             btn.Enabled = false;
             btn.Label = "安装中 0s";
             btn.Invalidate();
-            AppendDiag("正在通过 npx 安装 @deepseek-ai/dsh（需要联网，首次约 1-2 分钟）…", Theme.Current.LogWarn);
+            // 显式指定目标版本：@deepseek-ai/dsh 只发 rc 预发布版，npm 的 latest 标签停在较早的 rc，
+            // 不指定版本会装 latest（如 rc.7），导致"升级完成但版本没变"。
+            string pkg = "@deepseek-ai/dsh";
+            if (targetVersion.Length > 0) pkg += "@" + targetVersion;
+            AppendDiag("正在安装 " + pkg + "（需要联网，首次约 1-2 分钟）…", Theme.Current.LogWarn);
             AppendDiag("安装进度会实时显示在下方，请耐心等待。", Theme.Current.LogText);
 
             // 按钮上显示已用秒数，让用户明确知道"正在安装、没有卡死"
@@ -3456,10 +3565,14 @@ namespace DshManager
             };
             ticker.Start();
 
-            string npx = Path.Combine(Path.GetDirectoryName(DshService.NodeExe), "npx.cmd");
+            string npm = Path.Combine(Path.GetDirectoryName(DshService.NodeExe), "npm.cmd");
+            // npm 全局安装：常驻在 npm 全局目录（npm root -g），清理 npm 缓存不影响 dsh。
+            // --prefer-offline 尽量复用本地缓存；--no-audit/--no-fund 减少无谓网络请求，降低卡死概率。
+            // 全新安装整棵依赖树（几百个包）在网络不稳时仍可能较慢，故超时放宽到 30 分钟。
+            string installCmd = "/c \"" + npm + "\" install -g " + pkg + " --prefer-offline --no-audit --no-fund";
             // cmd /c 包装确保 .cmd 可执行；stdout/stderr 逐行追加到诊断框（实时进度）
-            // 整体超时 10 分钟：网络卡死时自动终止安装进程并复位界面，避免永久"安装中"
-            DshService.RunStream("cmd.exe", "/c \"" + npx + "\" --yes @deepseek-ai/dsh --version",
+            // 整体超时 30 分钟：网络卡死时自动终止安装进程并复位界面，避免永久"安装中"
+            DshService.RunStream("cmd.exe", installCmd,
                 delegate(string line)
                 {
                     string ln = line.Trim();
@@ -3483,19 +3596,51 @@ namespace DshManager
                         installingDsh = false;
                         if (timedOut)
                         {
-                            AppendDiag("安装超时（10 分钟），已终止安装进程。请检查网络后重试。", Theme.Current.LogErr);
-                            MessageBox.Show(this, "安装超时（10 分钟），已终止安装进程。\n请检查网络后重试。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            AppendDiag("安装超时（30 分钟），已终止安装进程。请检查网络后重试。", Theme.Current.LogErr);
+                            MessageBox.Show(this, "安装超时（30 分钟），已终止安装进程。\n请检查网络后重试。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            // 恢复升级前停止的实例（安装未完成，dsh 未被改动，可安全按原版本重启）
+                            foreach (InstanceRuntime rt in toRestart)
+                            {
+                                if (rt == null) continue;
+                                rt.Busy = false;
+                                rt.Cfg.ManualStopped = false;
+                                StartAsync(rt);
+                            }
                             return;
                         }
-                        DshService.Resolve(); // 重新解析
+                        // 全局安装后：通过 npm root -g 定位全局 node_modules，把 dsh 路径指向全局安装并持久化
+                        // （Resolve 的持久化路径优先，若不清掉/更新旧路径会继续用旧版本）
+                        string globalRoot = "";
+                        try { globalRoot = DshService.RunCapture(npm, "root -g").Trim(); } catch { }
+                        if (globalRoot.Length > 0)
+                        {
+                            string bin = Path.Combine(globalRoot, "@deepseek-ai", "dsh", "lib", "bin.js");
+                            if (File.Exists(bin))
+                            {
+                                Settings.Data.AutoDshPath = bin;
+                                Settings.Data.AutoNodePath = DshService.NodeExe;
+                                Settings.Save();
+                            }
+                        }
+                        DshService.Resolve(); // 重新解析并刷新版本
                         RunDiag();
                         if (DshService.BinJs.Length > 0)
+                        {
                             MessageBox.Show(this, "dsh 安装成功：" + DshService.BinJs + "\n版本：" + DshService.DshVersion, "安装完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                            // 升级前停止的实例自动重启（先清除 Busy/ManualStopped，允许看门狗与启动流程接管）
+                            foreach (InstanceRuntime rt in toRestart)
+                            {
+                                if (rt == null) continue;
+                                rt.Busy = false;
+                                rt.Cfg.ManualStopped = false;
+                                StartAsync(rt);
+                            }
+                        }
                         else
                             MessageBox.Show(this, "安装可能未成功，请检查网络后重试。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     });
                 },
-                600000); // 10 分钟整体超时
+                1800000); // 30 分钟整体超时
         }
 
         void RunDiag()
