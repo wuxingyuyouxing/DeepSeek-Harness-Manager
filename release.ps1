@@ -130,11 +130,12 @@ Step '签名安装版…'
 Sign-File $setupFinal
 
 # ── 6.5 生成 checksums.txt（管理器自更新校验用，覆盖最终产物）──────────
+# 注意：`@(expr1, expr2)` 字面量在本环境会塌缩成单元素（两行被拼成一行），
+# 必须先用变量承接两行，再以显式换行写入，确保每行一个 "hash  文件名"。
 $checksumsFile = Join-Path $root 'dist\checksums.txt'
-@(
-    (Get-FileHash $portable -Algorithm SHA256).Hash.ToLower() + "  " + (Split-Path $portable -Leaf),
-    (Get-FileHash $setupFinal -Algorithm SHA256).Hash.ToLower() + "  " + (Split-Path $setupFinal -Leaf)
-) | Set-Content $checksumsFile -Encoding ASCII
+$csLine1 = (Get-FileHash $portable -Algorithm SHA256).Hash.ToLower() + "  " + (Split-Path $portable -Leaf)
+$csLine2 = (Get-FileHash $setupFinal -Algorithm SHA256).Hash.ToLower() + "  " + (Split-Path $setupFinal -Leaf)
+Set-Content -Path $checksumsFile -Value ($csLine1 + "`r`n" + $csLine2) -Encoding ASCII
 Ok "校验文件：$checksumsFile"
 
 if ($DryRun) {
