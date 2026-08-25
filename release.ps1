@@ -1,4 +1,4 @@
-﻿# release.ps1 — 一键发布 DeepSeek Harness 管理器
+# release.ps1 — 一键发布 DeepSeek Harness 管理器
 # 流程：编译 → 打包(便携版+安装版) → 签名 → 提交/打tag/推送 → 创建 GitHub Release 并上传两个安装包
 # 凭据：优先 $env:GITHUB_TOKEN，否则复用 Git Credential Manager 已存的 GitHub 令牌（先 push 过即可）
 # 用法：
@@ -35,6 +35,18 @@ $parts = $Version -split '\.'
 $tagVer = ($parts[0..([math]::Min(2, $parts.Count - 1))] -join '.')
 $tag = "v$tagVer"
 Step "版本：$Version  →  tag：$tag"
+
+# ── 1.5 前置校验：README 版本信息必须已同步（防止发布时忘记更新）─────────
+$readme = Get-Content (Join-Path $root 'README.md') -Raw
+$expectCur     = "当前版本：**$tag**"
+$expectSetup   = "DeepSeek-Harness-Manager-Setup-$tag.exe"
+$expectPortable = "DeepSeek-Harness-Manager-Portable-$tag.zip"
+$bad = @()
+if (-not $readme.Contains($expectCur))      { $bad += "README「当前版本」应为 '$expectCur'" }
+if (-not $readme.Contains($expectSetup))    { $bad += "README「安装版文件名」应为 '$expectSetup'" }
+if (-not $readme.Contains($expectPortable)) { $bad += "README「便携版文件名」应为 '$expectPortable'" }
+if ($bad.Count -gt 0) { throw "发布前置校验失败：请先在 README.md 同步版本信息。`n  - " + ($bad -join "`n  - ") }
+Ok "README 版本信息已同步（$tag）"
 
 # ── 2. 便携 Node 准备 ──────────────────────────────────────────────────
 $nodeExe = Join-Path $root 'runtime\node\node.exe'
