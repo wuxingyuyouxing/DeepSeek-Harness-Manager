@@ -29,8 +29,8 @@ using Timer = System.Windows.Forms.Timer;
 [assembly: AssemblyProduct("DeepSeek Harness Manager")]
 [assembly: AssemblyCompany("DeepSeek Harness")]
 [assembly: AssemblyCopyright("Copyright © 2026 DeepSeek Harness")]
-[assembly: AssemblyVersion("1.2.2.0")]
-[assembly: AssemblyFileVersion("1.2.2.0")]
+[assembly: AssemblyVersion("1.2.3.0")]
+[assembly: AssemblyFileVersion("1.2.3.0")]
 
 namespace DshManager
 {
@@ -442,6 +442,18 @@ namespace DshManager
             }
             catch { }
         }
+
+        // 追加一行到 logs\manager.log（带时间戳）；供 SafeInvoke 等吞异常处记录现场，避免问题完全隐形
+        public static void Log(string msg)
+        {
+            try
+            {
+                if (!Directory.Exists(LogsDir)) Directory.CreateDirectory(LogsDir);
+                File.AppendAllText(Path.Combine(LogsDir, "manager.log"),
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + msg + Environment.NewLine, Encoding.UTF8);
+            }
+            catch { }
+        }
     }
 
     // ───────────────────────────────────────────────────────────── 服务控制
@@ -732,7 +744,7 @@ namespace DshManager
             return true;
         }
 
-        public static string RunCapture(string file, string args)
+        public static string RunCapture(string file, string args, int timeoutMs = 8000)
         {
             try
             {
@@ -747,9 +759,17 @@ namespace DshManager
                 psi.StandardErrorEncoding = Encoding.UTF8;
                 using (Process p = Process.Start(psi))
                 {
-                    string o = p.StandardOutput.ReadToEnd();
-                    string e = p.StandardError.ReadToEnd();
-                    p.WaitForExit(8000);
+                    // 异步同时读 stdout/stderr，避免管道缓冲写满导致的死锁；WaitForExit(timeout) 才是真超时
+                    var outTask = p.StandardOutput.ReadToEndAsync();
+                    var errTask = p.StandardError.ReadToEndAsync();
+                    if (!p.WaitForExit(timeoutMs))
+                    {
+                        try { p.Kill(); } catch { }
+                        try { p.WaitForExit(2000); } catch { }
+                        return ""; // 超时，丢弃不完整输出
+                    }
+                    string o = outTask.Result; // 进程已退出，流已关闭，Result 立即返回
+                    string e = errTask.Result;
                     return (o + e).Trim();
                 }
             }
@@ -2844,7 +2864,7 @@ namespace DshManager
             btnInstall.Label = "一键安装 dsh";
             btnInstall.Location = new Point((int)Ui.P(242), (int)Ui.P(7));
             btnInstall.Size = new Size((int)Ui.P(116), (int)Ui.P(32));
-            btnInstall.Click += delegate { InstallDsh(btnInstall, "一键安装 dsh", UpdateService.DshLatest, null); };
+            btnInstall.Click += delegate { InstallDsh(btnInstall, "一键安装 dsh", UpdateService.DshLatest); };
             bar.Controls.Add(btnInstall);
 
             // 手动指定 node/dsh 路径（适配源码仓库/自建安装等非标准方式）
@@ -3312,7 +3332,7 @@ namespace DshManager
         }
 
         // 一键升级 dsh（targetVersion：目标版本；trackLabel：按钮/弹窗文案，如"一键升级 dsh"/"升级到预览版"）
-        // 安全原则：若 dsh 正在运行，先停止（绝不覆盖运行中的文件），升级完成后自动重启。
+        // 停服安全（先停止运行中的全部实例、装完自动重启）统一由 InstallDsh 内部处理。
         void UpgradeDsh(PillButton btn, string targetVersion, string trackLabel)
         {
             if (!DshUpgradeable())
@@ -3328,30 +3348,7 @@ namespace DshManager
                 MessageBox.Show(this, "dsh 已是最新版本（" + localDsh + "），无需升级。", trackLabel, MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            // 升级会替换 dsh 程序文件：正在运行的实例必须先停止，完成后自动重启
-            List<InstanceRuntime> toRestart = new List<InstanceRuntime>();
-            foreach (InstanceRuntime rt in runtimes)
-            {
-                if (rt.State == SvcState.Running || rt.State == SvcState.Starting)
-                {
-                    if (MessageBox.Show(this,
-                        "检测到 dsh 服务正在运行（PID " + rt.Pid + "）。\n升级将替换 dsh 程序文件，为避免破坏正在运行的服务，会先停止服务，升级完成后自动重启。\n\n继续吗？",
-                        trackLabel, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
-                        return;
-                    toRestart.Add(rt);
-                    break;
-                }
-            }
-            // 停止前打上 Busy + ManualStopped 标记：阻止看门狗在安装期间把服务自动拉起
-            // （否则会覆盖运行中的文件，造成损坏）；安装完成后由 InstallDsh 清除并自动重启
-            foreach (InstanceRuntime rt in toRestart)
-            {
-                rt.Busy = true;
-                rt.Cfg.ManualStopped = true;
-                DshService.Stop(rt, false);
-            }
-            UpdateSelectedUi();
-            InstallDsh(btn, trackLabel, targetVersion, toRestart);
+            InstallDsh(btn, trackLabel, targetVersion);
         }
 
         // 管理器半自动自更新：下载便携包 → 校验 → 解压 → update.bat 替换 → 自动重启
@@ -3532,8 +3529,10 @@ namespace DshManager
 
         // 通过 npm 全局安装/升级 dsh CLI（后台执行，输出实时流式显示在诊断框，按钮显示已用秒数）
         // 全局安装常驻在 npm 全局目录（npm root -g），用户清理 npm 缓存不会把 dsh 清掉。
-        // targetVersion：目标版本号（"" 表示装 npm latest 标签）；toRestart：升级前已停止、完成后需自动重启的实例
-        void InstallDsh(PillButton btn, string doneLabel, string targetVersion, List<InstanceRuntime> toRestart)
+        // targetVersion：目标版本号（"" 表示装 npm latest 标签）。
+        // 安全原则（唯一的安防点）：安装/升级会替换 dsh 程序文件，若检测到实例正在运行，
+        // 一律先停止全部（绝不覆盖运行中的文件），完成后自动重启。升级与「一键安装」共用本方法。
+        void InstallDsh(PillButton btn, string doneLabel, string targetVersion)
         {
             if (DshService.NodeExe.Length == 0) DshService.Resolve();
             if (DshService.NodeExe.Length == 0)
@@ -3546,6 +3545,34 @@ namespace DshManager
             btn.Enabled = false;
             btn.Label = "安装中 0s";
             btn.Invalidate();
+            // 停服安全：收集全部运行中实例 → 弹窗确认 → 打 Busy/ManualStopped 标记（双保险阻断看门狗）→ 停止
+            List<InstanceRuntime> toRestart = new List<InstanceRuntime>();
+            foreach (InstanceRuntime rt in runtimes)
+            {
+                if (rt.State == SvcState.Running || rt.State == SvcState.Starting) toRestart.Add(rt);
+            }
+            if (toRestart.Count > 0)
+            {
+                string msg = "检测到 " + toRestart.Count + " 个 dsh 实例正在运行。\n"
+                    + "安装/升级将替换 dsh 程序文件，为避免破坏正在运行的服务，会先停止这些实例，完成后自动重启。\n\n继续吗？";
+                if (MessageBox.Show(this, msg, doneLabel, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                {
+                    btn.Enabled = true;
+                    btn.Label = doneLabel;
+                    btn.Invalidate();
+                    installingDsh = false;
+                    return;
+                }
+            }
+            foreach (InstanceRuntime rt in toRestart)
+            {
+                rt.Busy = true;                 // 阻断看门狗轮询自动拉起
+                rt.Cfg.ManualStopped = true;    // 阻断看门狗（双保险）
+                DshService.Stop(rt, false);
+                rt.State = SvcState.Stopped;    // 立即反映到 UI（否则安装期间一直显示"运行中"）
+            }
+            UpdateSelectedUi();
+
             // 显式指定目标版本：@deepseek-ai/dsh 只发 rc 预发布版，npm 的 latest 标签停在较早的 rc，
             // 不指定版本会装 latest（如 rc.7），导致"升级完成但版本没变"。
             string pkg = "@deepseek-ai/dsh";
@@ -3567,11 +3594,27 @@ namespace DshManager
 
             string npm = Path.Combine(Path.GetDirectoryName(DshService.NodeExe), "npm.cmd");
             // npm 全局安装：常驻在 npm 全局目录（npm root -g），清理 npm 缓存不影响 dsh。
-            // --prefer-offline 尽量复用本地缓存；--no-audit/--no-fund 减少无谓网络请求，降低卡死概率。
-            // 全新安装整棵依赖树（几百个包）在网络不稳时仍可能较慢，故超时放宽到 30 分钟。
-            string installCmd = "/c \"" + npm + "\" install -g " + pkg + " --prefer-offline --no-audit --no-fund";
+            // ⚠ 不能用 --prefer-offline：它会命中过期的 packument 缓存，dsh 升级到新版本后，
+            //   npm 仍按旧清单解析，直接 ETARGET "No matching version found" 秒失败；
+            //   而旧 dsh 还在，若不校验版本会误报"安装完成"（实测 0.1.1-rc.2 升级踩过这个坑）。
+            // --dangerously-allow-all-scripts：npm 11+ 默认不执行安装脚本，而 dsh 依赖 node-pty、
+            //   koffi 等原生模块，必须跑其 install/postinstall 脚本才能构建完整；该开关恢复
+            //   npm 11 之前的默认行为（安装的是官方信任包，属预期行为）。
+            // --no-audit/--no-fund 减少无谓网络请求；整棵依赖树较慢时由 30 分钟超时兜底。
+            string installCmd = "/c \"" + npm + "\" install -g " + pkg + " --dangerously-allow-all-scripts --no-audit --no-fund";
             // cmd /c 包装确保 .cmd 可执行；stdout/stderr 逐行追加到诊断框（实时进度）
             // 整体超时 30 分钟：网络卡死时自动终止安装进程并复位界面，避免永久"安装中"
+            // 恢复安装前停止的实例（无论安装成败都调用，保证服务不被长时间中断）
+            Action restoreInstances = delegate
+            {
+                foreach (InstanceRuntime rt in toRestart)
+                {
+                    if (rt == null) continue;
+                    rt.Busy = false;
+                    rt.Cfg.ManualStopped = false;
+                    StartAsync(rt);
+                }
+            };
             DshService.RunStream("cmd.exe", installCmd,
                 delegate(string line)
                 {
@@ -3598,14 +3641,8 @@ namespace DshManager
                         {
                             AppendDiag("安装超时（30 分钟），已终止安装进程。请检查网络后重试。", Theme.Current.LogErr);
                             MessageBox.Show(this, "安装超时（30 分钟），已终止安装进程。\n请检查网络后重试。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                            // 恢复升级前停止的实例（安装未完成，dsh 未被改动，可安全按原版本重启）
-                            foreach (InstanceRuntime rt in toRestart)
-                            {
-                                if (rt == null) continue;
-                                rt.Busy = false;
-                                rt.Cfg.ManualStopped = false;
-                                StartAsync(rt);
-                            }
+                            restoreInstances(); // 安装未完成，dsh 未被改动，按原版本恢复服务
+                            RefreshAbout();
                             return;
                         }
                         // 全局安装后：通过 npm root -g 定位全局 node_modules，把 dsh 路径指向全局安装并持久化
@@ -3624,20 +3661,24 @@ namespace DshManager
                         }
                         DshService.Resolve(); // 重新解析并刷新版本
                         RunDiag();
-                        if (DshService.BinJs.Length > 0)
+                        // 校验安装结果：只有安装后的 dsh 版本与目标一致才算成功。
+                        // （npm 失败时旧 dsh 仍被 Resolve 解析出，若不校验版本会误报"安装完成"，
+                        //   实测旧版 0.1.1-rc.2 升级：--prefer-offline 秒失败却提示"安装完成 0.1.0-rc.7"）
+                        bool ok = DshService.BinJs.Length > 0;
+                        if (ok && targetVersion.Length > 0)
+                            ok = UpdateService.CompareVersions(DshService.DshVersion, targetVersion) == 0;
+                        if (ok)
                         {
+                            AppendDiag("安装完成：" + DshService.BinJs + "（版本 " + DshService.DshVersion + "）", Theme.Current.LogText);
                             MessageBox.Show(this, "dsh 安装成功：" + DshService.BinJs + "\n版本：" + DshService.DshVersion, "安装完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                            // 升级前停止的实例自动重启（先清除 Busy/ManualStopped，允许看门狗与启动流程接管）
-                            foreach (InstanceRuntime rt in toRestart)
-                            {
-                                if (rt == null) continue;
-                                rt.Busy = false;
-                                rt.Cfg.ManualStopped = false;
-                                StartAsync(rt);
-                            }
                         }
                         else
-                            MessageBox.Show(this, "安装可能未成功，请检查网络后重试。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        {
+                            AppendDiag("升级未成功：dsh 当前仍为 " + DshService.DshVersion + "，目标 " + targetVersion + "。请查看上方 npm 日志（常见原因：网络问题或 npm 缓存过期）。", Theme.Current.LogErr);
+                            MessageBox.Show(this, "升级未成功：dsh 当前仍为 " + DshService.DshVersion + "，目标 " + targetVersion + "。\n请查看诊断日志中的 npm 报错，可稍后重试。", "升级失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        }
+                        restoreInstances(); // 无论成败都恢复服务（失败则按旧版本继续运行，服务不中断）
+                        RefreshAbout();     // 完成后立即刷新 About 页版本显示
                     });
                 },
                 1800000); // 30 分钟整体超时
@@ -3750,7 +3791,11 @@ namespace DshManager
                 if (InvokeRequired) BeginInvoke(a);
                 else a();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                // 不能吞掉异常后完全无痕：记录到日志，便于定位 UI 线程内的隐性 bug
+                try { Settings.Log("SafeInvoke: " + ex); } catch { }
+            }
         }
 
         void UpdateSelectedUi()
