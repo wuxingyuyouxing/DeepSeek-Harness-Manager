@@ -29,8 +29,8 @@ using Timer = System.Windows.Forms.Timer;
 [assembly: AssemblyProduct("DeepSeek Harness Manager")]
 [assembly: AssemblyCompany("DeepSeek Harness")]
 [assembly: AssemblyCopyright("Copyright © 2026 DeepSeek Harness")]
-[assembly: AssemblyVersion("1.2.3.0")]
-[assembly: AssemblyFileVersion("1.2.3.0")]
+[assembly: AssemblyVersion("1.2.5.0")]
+[assembly: AssemblyFileVersion("1.2.5.0")]
 
 namespace DshManager
 {
@@ -187,7 +187,7 @@ namespace DshManager
         public string Key;
         public Color Page, Surface, SurfaceAlt, Sidebar, Border, BorderStrong, Text, TextMuted, TextFaint;
         public Color Accent, AccentHover, AccentSoft, Ok, Warn, Err;
-        public Color LogBack, LogText, LogErr, LogWarn;
+        public Color LogBack, LogText, LogErr, LogWarn, LogStderr;
         public bool IsDark;
 
         public static Theme Current = Light;
@@ -214,6 +214,7 @@ namespace DshManager
             LogText = Color.FromArgb(66, 72, 88),
             LogErr = Color.FromArgb(214, 62, 62),
             LogWarn = Color.FromArgb(196, 128, 20),
+            LogStderr = Color.FromArgb(203, 96, 72), // stderr 专属色（锈红，区别于错误红/警告橙）
         };
 
         public static readonly Theme Dark = new Theme
@@ -238,6 +239,7 @@ namespace DshManager
             LogText = Color.FromArgb(196, 202, 216),
             LogErr = Color.FromArgb(255, 129, 129),
             LogWarn = Color.FromArgb(240, 197, 116),
+            LogStderr = Color.FromArgb(255, 173, 138), // stderr 专属色（浅橙，区别于错误红/警告橙）
         };
 
         public static void Apply(string key)
@@ -475,6 +477,7 @@ namespace DshManager
         public string LastError = "";
         public Process Proc;
         public StreamWriter SwOut, SwErr;
+        public string AuthUrl = ""; // dsh 0.1.2-rc+ 启动时打印的带令牌访问 URL（http://host:port/?token=...）
     }
 
     static class DshService
@@ -842,9 +845,16 @@ namespace DshManager
             }
         }
 
-        // 探测 URL 是否为 DSH 实例（页面含 __DSH_BOOT__ 标记）
+        // 探测 URL 是否为 DSH 实例。
+        // dsh 0.1.2-rc 起新增令牌鉴权：根路径无 token/无 Cookie 一律 401
+        // （"dsh web authentication required..."——该响应本身即证明 dsh web 已在线）；
+        // 带 token 访问会被 303 种会话 Cookie 后跳转到干净根路径，需用 CookieContainer
+        // 跟随重定向并携带 Cookie，最终 200 页面含 __DSH_BOOT__ 标记。
+        // 兼容：旧版无鉴权，直接 200 + 标记。
         public static bool Probe(string url)
         {
+            int code = 0;
+            string body = "";
             try
             {
                 HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
@@ -852,29 +862,82 @@ namespace DshManager
                 req.Timeout = 2500;
                 req.ReadWriteTimeout = 2500;
                 req.UserAgent = "DSH-Manager/1.0";
+                req.CookieContainer = new CookieContainer(); // 跟随 303 重定向时保留服务端种下的 Cookie
                 using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
                 {
-                    if ((int)resp.StatusCode >= 400) return false;
+                    code = (int)resp.StatusCode;
                     using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                        body = sr.ReadToEnd();
+                }
+            }
+            catch (WebException wex)
+            {
+                try
+                {
+                    using (HttpWebResponse er = (HttpWebResponse)wex.Response)
                     {
-                        string body = sr.ReadToEnd();
-                        return body.IndexOf("__DSH_BOOT__", StringComparison.Ordinal) >= 0 ||
-                               body.IndexOf("@deepseek-ai", StringComparison.Ordinal) >= 0;
+                        if (er == null) return false;
+                        code = (int)er.StatusCode;
+                        using (StreamReader sr = new StreamReader(er.GetResponseStream(), Encoding.UTF8))
+                            body = sr.ReadToEnd();
+                    }
+                }
+                catch { return false; }
+            }
+            catch { return false; }
+
+            // dsh 在线判定：
+            // 1) 200 + 应用标记（旧版根路径 / 新版带 Cookie 握手后的页面）
+            if (code >= 200 && code < 300 &&
+                (body.IndexOf("__DSH_BOOT__", StringComparison.Ordinal) >= 0 ||
+                 body.IndexOf("@deepseek-ai", StringComparison.Ordinal) >= 0))
+                return true;
+            // 2) dsh 鉴权服务器自身的 401：无 token 时也证明 dsh web 已在线（0.1.2-rc+）
+            if (code == 401 && body.IndexOf("authentication required", StringComparison.Ordinal) >= 0)
+                return true;
+            return false;
+        }
+
+        // 从最新 .out.log 解析 dsh 打印的带令牌 URL（http://host:port/?token=...）。
+        // 覆盖"管理器重启后服务已在运行"等启动时 stdout 未捕获到令牌的场景；
+        // 已捕获则立即返回。令牌按进程激活生成，最新日志对应最新一次运行。
+        public static void EnsureAuthUrl(InstanceRuntime rt)
+        {
+            if (rt.AuthUrl.Length > 0 || rt.Pid == 0) return;
+            try
+            {
+                string pat = rt.Cfg.Slug + "-*.out.log";
+                string[] files = Directory.GetFiles(Settings.LogsDir, pat);
+                Array.Sort(files, delegate(string a, string b)
+                {
+                    return Directory.GetLastWriteTime(a).CompareTo(Directory.GetLastWriteTime(b));
+                });
+                for (int i = files.Length - 1; i >= 0 && rt.AuthUrl.Length == 0; i--)
+                {
+                    string[] ls = File.ReadAllLines(files[i]);
+                    foreach (string l in ls)
+                    {
+                        Match m = Regex.Match(l, @"https?://[^\s'""><\u001b]+");
+                        if (m.Success && m.Value.IndexOf("?token=", StringComparison.Ordinal) >= 0)
+                        {
+                            rt.AuthUrl = m.Value;
+                            break;
+                        }
                     }
                 }
             }
-            catch { return false; }
+            catch { }
         }
 
-        // DSH 0.1.0-rc 系列出于安全限制拒绝 --host 0.0.0.0（防远程代码执行），不支持局域网绑定：
-        //   dsh-web-app 的 startup.js 硬性报错"intentionally not supported yet for safety"，
-        //   且 webserver 配置 schema 只允许 "127.0.0.1" | "0.0.0.0"。
-        // 版本未知时保守按"不支持"。DSH 未来版本若放开 0.0.0.0，此判断需相应更新。
+        // DSH 0.1.x-rc 系列均拒绝 --host 0.0.0.0（防远程代码执行），不支持局域网绑定：
+        //   dsh-web-app 启动时硬性报错"intentionally not supported yet for safety"，
+        //   且 webserver 配置只允许 "127.0.0.1" | "0.0.0.0"。
+        // 版本未知时保守按"不支持"。DSH 未来放开 0.0.0.0 后，此判断需相应更新。
         public static bool SupportsLan()
         {
             string v = DshVersion;
             if (v.Length == 0) return false;
-            return !v.StartsWith("0.1.0-rc", StringComparison.OrdinalIgnoreCase);
+            return !Regex.IsMatch(v, @"^0\.1\.\d+-rc", RegexOptions.IgnoreCase);
         }
 
         public static SvcState Detect(InstanceRuntime rt)
@@ -887,9 +950,10 @@ namespace DshManager
                     if (rt.SwOut != null) { try { rt.SwOut.Dispose(); } catch { } rt.SwOut = null; }
                     if (rt.SwErr != null) { try { rt.SwErr.Dispose(); } catch { } rt.SwErr = null; }
                 }
-                if (Probe(rt.Cfg.Url))
+                if (Probe(rt.AuthUrl.Length > 0 ? rt.AuthUrl : rt.Cfg.Url))
                 {
                     if (rt.Pid == 0) rt.Pid = Native.GetPidByPort(rt.Cfg.Port);
+                    EnsureAuthUrl(rt); // 补抓带令牌 URL（启动时漏抓/管理器重启后服务已在跑）
                     return SvcState.Running;
                 }
                 if (rt.Proc != null) return SvcState.Starting;
@@ -907,6 +971,7 @@ namespace DshManager
         public static bool Start(InstanceRuntime rt, Action<string> log)
         {
             rt.LastError = "";
+            rt.AuthUrl = ""; // 每次启动进程都会生成新的访问令牌，旧令牌作废
             try
             {
                 if (!Resolve(rt))
@@ -942,7 +1007,15 @@ namespace DshManager
 
                 p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
                 {
-                    if (e.Data != null && rt.SwOut != null) { lock (rt.SwOut) rt.SwOut.WriteLine(e.Data); }
+                    if (e.Data == null) return;
+                    if (rt.SwOut != null) { lock (rt.SwOut) rt.SwOut.WriteLine(e.Data); }
+                    // dsh 0.1.2-rc+ 启动时打印带令牌 URL（http://host:port/?token=...），捕获供探测/打开浏览器使用
+                    if (rt.AuthUrl.Length == 0)
+                    {
+                        Match m = Regex.Match(e.Data, @"https?://[^\s'""><\u001b]+");
+                        if (m.Success && m.Value.IndexOf("?token=", StringComparison.Ordinal) >= 0)
+                            rt.AuthUrl = m.Value;
+                    }
                 };
                 p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
                 {
@@ -1740,7 +1813,7 @@ namespace DshManager
     // 自绘日志控件：完全主题化（无 RichTextBox 在深色下的灰色怪癖），支持滚轮与自动滚动
     class LogView : BaseControl
     {
-        class Line { public string Text; public int Level; } // 0=普通 1=警告 2=错误
+        class Line { public string Text; public int Level; public bool IsErr; } // 0=普通 1=警告 2=错误；IsErr=来自 stderr(.err.log)
         List<Line> lines = new List<Line>();
         int scrollTop;
         bool autoScroll = true;
@@ -1760,10 +1833,10 @@ namespace DshManager
             BackColor = Color.Black; // 防闪烁，实际底色在 OnPaint 中按主题绘制
         }
 
-        public void AppendLine(string text, int level)
+        public void AppendLine(string text, int level, bool isErr = false)
         {
             if (lines.Count > 3000) lines.RemoveAt(0);
-            lines.Add(new Line { Text = text, Level = level });
+            lines.Add(new Line { Text = text, Level = level, IsErr = isErr });
             if (autoScroll) ScrollToEnd();
             Invalidate();
         }
@@ -1807,7 +1880,12 @@ namespace DshManager
             for (int i = scrollTop; i < n; i++)
             {
                 Line ln = lines[i];
-                Color c = ln.Level == 2 ? T.LogErr : (ln.Level == 1 ? T.LogWarn : T.LogText);
+                // stderr 行整体用专属色（不依赖关键字），错误/警告关键字仍优先用红/橙强调
+                Color c;
+                if (ln.IsErr && ln.Level == 0) c = T.LogStderr;
+                else if (ln.Level == 2) c = T.LogErr;
+                else if (ln.Level == 1) c = T.LogWarn;
+                else c = T.LogText;
                 using (SolidBrush tb = new SolidBrush(c))
                     g.DrawString(ln.Text, mono, tb, 6f, y);
                 y += lh;
@@ -2496,7 +2574,10 @@ namespace DshManager
                 btnBrowser.Invalidate();
                 Task.Run(delegate
                 {
-                    try { Process.Start(rt.Cfg.Url); } catch { }
+                    // 服务已在运行时从日志补抓带令牌 URL（dsh 0.1.2-rc+），否则打开的是 401 页
+                    if (rt.AuthUrl.Length == 0) DshService.EnsureAuthUrl(rt);
+                    string open = rt.AuthUrl.Length > 0 ? rt.AuthUrl : rt.Cfg.Url;
+                    try { Process.Start(open); } catch { }
                     SafeInvoke(delegate
                     {
                         btnBrowser.Label = "打开浏览器";
@@ -3959,20 +4040,52 @@ namespace DshManager
         // ── 日志 ──
         Dictionary<string, long> logPos = new Dictionary<string, long>();
         Dictionary<string, string> logFile = new Dictionary<string, string>();
+        // ANSI 转义：颜色(CSI SGR)、光标移动/清屏(CSI)、OSC、其他 C1/双字节转义全部剔除，避免日志页出现乱码
+        static readonly Regex AnsiRe = new Regex(
+            "\u001b\\[[0-9;?]*[ -/]*[@-~]|\u001b\\][^\u0007\u001b]*(\u0007|\u001b\\\\)|\u001b[@-Z\\\\_-]");
+
+        // 单个日志文件源：Path=文件路径；IsErr=true 表示 stderr(.err.log)，否则 stdout(.out.log)
+        class LogSrc
+        {
+            public string Path; public bool IsErr;
+            public LogSrc(string p, bool e) { Path = p; IsErr = e; }
+        }
+
+        // 按时间先后收集所选实例的 stdout(.out.log) + stderr(.err.log) 全部日志文件
+        LogSrc[] GetLogFiles(string slug)
+        {
+            List<LogSrc> res = new List<LogSrc>();
+            try
+            {
+                if (!Directory.Exists(Settings.LogsDir)) return res.ToArray();
+                res.AddRange(Directory.GetFiles(Settings.LogsDir, slug + "-*.out.log").Select(f => new LogSrc(f, false)));
+                res.AddRange(Directory.GetFiles(Settings.LogsDir, slug + "-*.err.log").Select(f => new LogSrc(f, true)));
+                if (res.Count == 0) // 兼容旧 npx 缓存布局
+                {
+                    res.AddRange(Directory.GetFiles(Settings.LogsDir, "dsh-web-*.out.log").Select(f => new LogSrc(f, false)));
+                    res.AddRange(Directory.GetFiles(Settings.LogsDir, "dsh-web-*.err.log").Select(f => new LogSrc(f, true)));
+                }
+                res.Sort((a, b) => Directory.GetLastWriteTime(a.Path).CompareTo(Directory.GetLastWriteTime(b.Path)));
+            }
+            catch { }
+            return res.ToArray();
+        }
 
         void RefreshLogs()
         {
             if (selected == null || logView == null || !logView.Visible) return;
             string slug = selected.Cfg.Slug;
-            string[] files = GetLogFiles(slug);
-            foreach (string f in files)
+            LogSrc[] files = GetLogFiles(slug);
+            foreach (LogSrc s in files)
             {
-                string key = slug + "|" + Path.GetFileName(f);
+                string f = s.Path;
+                string key = slug + "|" + (s.IsErr ? "e" : "o") + "|" + Path.GetFileName(f);
                 long pos = 0;
                 logPos.TryGetValue(key, out pos);
                 string prev = "";
                 logFile.TryGetValue(key, out prev);
-                if (prev != f) { pos = 0; }
+                bool firstLoad = (prev != f); // 本次会话首次读到该文件：整读并插分隔线
+                if (firstLoad) pos = 0;
                 try
                 {
                     using (FileStream fs = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
@@ -3984,8 +4097,12 @@ namespace DshManager
                         if (read > 0)
                         {
                             string text = Encoding.UTF8.GetString(buf, 0, read);
-                            text = Regex.Replace(text, "\x1b\\[[0-9;]*m", "");
+                            if (pos == 0 && text.Length > 0 && text[0] == '\uFEFF') text = text.Substring(1); // 去 BOM
+                            text = AnsiRe.Replace(text, "");
                             string[] lines = text.Split('\n');
+                            if (firstLoad && lines.Length > 0) // 每次运行一条分隔线，便于区分多次运行
+                                logView.AppendLine("──── " + Directory.GetLastWriteTime(f).ToString("yyyy-MM-dd HH:mm:ss")
+                                    + (s.IsErr ? " · stderr ────" : " ────"), 0, false);
                             foreach (string ln in lines)
                             {
                                 if (ln.Length == 0) continue;
@@ -3993,7 +4110,7 @@ namespace DshManager
                                 int level = 0;
                                 if (low.Contains("error") || low.Contains("fail") || low.Contains("exception")) level = 2;
                                 else if (low.Contains("warn")) level = 1;
-                                logView.AppendLine(ln.TrimEnd('\r'), level);
+                                logView.AppendLine(ln.TrimEnd('\r'), level, s.IsErr);
                             }
                         }
                         logPos[key] = pos + read;
@@ -4002,21 +4119,6 @@ namespace DshManager
                 }
                 catch { }
             }
-        }
-
-        string[] GetLogFiles(string slug)
-        {
-            List<string> res = new List<string>();
-            try
-            {
-                if (!Directory.Exists(Settings.LogsDir)) return res.ToArray();
-                string pat = slug + "-*.out.log";
-                res.AddRange(Directory.GetFiles(Settings.LogsDir, pat).OrderBy(x => Directory.GetLastWriteTime(x)));
-                if (res.Count == 0)
-                    res.AddRange(Directory.GetFiles(Settings.LogsDir, "dsh-web-*.out.log").OrderBy(x => Directory.GetLastWriteTime(x)));
-            }
-            catch { }
-            return res.ToArray();
         }
 
         // ── 看门狗 ──
@@ -4065,6 +4167,15 @@ namespace DshManager
 
                 SvcState final = st;
                 bool okStart = ok;
+                if (final == SvcState.Running)
+                {
+                    // 稍候捕获 dsh 0.1.2-rc+ 打印的带令牌 URL（启动初期可能尚未打印），供打开浏览器使用
+                    for (int i = 0; i < 12 && rt.AuthUrl.Length == 0; i++)
+                    {
+                        Thread.Sleep(200);
+                        DshService.EnsureAuthUrl(rt);
+                    }
+                }
                 SafeInvoke(delegate
                 {
                     rt.Busy = false;
@@ -4090,18 +4201,19 @@ namespace DshManager
                     }
                     else if (final == SvcState.Running)
                     {
-                        // 启动成功：明确告知访问地址，避免用户不知道要在浏览器中使用
+                        // 启动成功：明确告知访问地址（优先带令牌 URL，dsh 0.1.2-rc+ 必须用它才能访问）
+                        string open = rt.AuthUrl.Length > 0 ? rt.AuthUrl : rt.Cfg.Url;
                         if (rt.Cfg.AutoOpenBrowser)
                         {
-                            try { Process.Start(rt.Cfg.Url); } catch { }
+                            try { Process.Start(open); } catch { }
                             if (!silent)
                             {
-                                try { tray.ShowBalloonTip(4000, "DeepSeek Harness", "服务已启动：" + rt.Cfg.Url + "\n已在浏览器中打开。", ToolTipIcon.Info); } catch { }
+                                try { tray.ShowBalloonTip(4000, "DeepSeek Harness", "服务已启动：" + open + "\n已在浏览器中打开。", ToolTipIcon.Info); } catch { }
                             }
                         }
                         else if (!silent)
                         {
-                            try { tray.ShowBalloonTip(4000, "DeepSeek Harness", "服务已启动：" + rt.Cfg.Url + "\n在「概览」页点击「打开浏览器」即可使用。", ToolTipIcon.Info); } catch { }
+                            try { tray.ShowBalloonTip(4000, "DeepSeek Harness", "服务已启动：" + open + "\n在「概览」页点击「打开浏览器」即可使用。", ToolTipIcon.Info); } catch { }
                         }
                     }
                     else if (final == SvcState.Occupied)
