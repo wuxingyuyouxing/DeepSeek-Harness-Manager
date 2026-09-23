@@ -39,43 +39,92 @@ function Write-Log([string]$msg) {
     } catch { }
 }
 
-# 是否已经有一个 DSH 实例在响应（以页面里的 __DSH_BOOT__ 标记为准）
+# 是否已经有一个 DSH 实例在响应。
+# dsh 0.1.2-rc+ 对无 token 的根路径返回 401 "dsh web authentication required"，
+# 该响应本身即证明 dsh 服务已就绪（与管理器 Probe 的判定一致）；旧版则看 __DSH_BOOT__ 标记。
+# PS5.1/PS7 的对象模型不同：PS7 用 -SkipHttpErrorCheck 直接拿 401 响应（异常路径的 Response
+# 已被释放读不到正文），PS5.1 只能从异常的 HttpWebResponse 读。
 function Test-DshRunning {
     try {
-        $r = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3 -Method Get
-        if ($r.StatusCode -ge 200 -and $r.StatusCode -lt 400) {
-            return ($r.Content -match '__DSH_BOOT__' -or $r.Content -match '@deepseek-ai')
+        $status = 0; $content = ''
+        if ($PSVersionTable.PSVersion.Major -ge 7) {
+            $r = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3 -Method Get -SkipHttpErrorCheck
+            $status = [int]$r.StatusCode; $content = [string]$r.Content
+        } else {
+            try {
+                $r = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3 -Method Get
+                $status = [int]$r.StatusCode; $content = [string]$r.Content
+            } catch {
+                $resp = $_.Exception.Response
+                if ($resp) { $status = [int]$resp.StatusCode }
+                if ($status -eq 401) {
+                    try {
+                        $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+                        $content = $sr.ReadToEnd(); $sr.Close()
+                    } catch { }
+                } else { return $false }
+            }
         }
+        if ($status -ge 200 -and $status -lt 400) {
+            return ($content -match '__DSH_BOOT__' -or $content -match '@deepseek-ai')
+        }
+        if ($status -eq 401 -and $content -match 'authentication required') { return $true }
     } catch { }
     return $false
 }
 
-# 定位 node.exe
+# 定位 node.exe（优先随包便携 Node，与管理器定位顺序一致）
 function Find-NodeExe {
+    # 1. 随包便携 Node
+    $bundled = Join-Path $Root 'runtime\node\node.exe'
+    if (Test-Path $bundled) { return $bundled }
+    # 2. PATH（条目去引号，避免第三方安装器带引号的 PATH 项漏判）
     $c = Get-Command node.exe -ErrorAction SilentlyContinue
     if ($c) { return $c.Source }
     $c2 = Get-Command node -ErrorAction SilentlyContinue
     if ($c2 -and $c2.CommandType -eq 'Application') { return $c2.Source }
     foreach ($d in ($env:PATH -split ';')) {
-        if ($d) { $p = Join-Path $d 'node.exe'; if (Test-Path $p) { return $p } }
+        $d2 = if ($d) { $d.Trim('"') } else { '' }
+        if ($d2) { $p = Join-Path $d2 'node.exe'; if (Test-Path $p) { return $p } }
     }
     return $null
 }
 
-# 定位 dsh 的入口 bin.js（优先 PATH 上的 dsh.cmd，其次 npx 缓存）
+# 定位 dsh 的入口 bin.js（PATH 上的 dsh.cmd → npm root -g 全局安装 → npx 缓存）
 function Find-DshBinJs {
+    # 1. PATH 上的 dsh 命令 → npm 安装布局
     $cmd = Get-Command 'dsh.cmd' -ErrorAction SilentlyContinue
     if ($cmd) {
         $bin = Join-Path (Split-Path $cmd.Source -Parent) '..\@deepseek-ai\dsh\lib\bin.js'
         if (Test-Path $bin) { return (Resolve-Path $bin).Path }
     }
-    $npxRoot = Join-Path $env:LOCALAPPDATA 'npm-cache\_npx'
-    if (Test-Path $npxRoot) {
-        $dirs = Get-ChildItem $npxRoot -Directory -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending
-        foreach ($d in $dirs) {
-            $cand = Join-Path $d.FullName 'node_modules\@deepseek-ai\dsh\lib\bin.js'
-            if (Test-Path $cand) { return (Resolve-Path $cand).Path }
+    # 2. npm 全局安装目录（npm root -g）——管理器"一键安装 dsh"即装到这里
+    $node = Find-NodeExe
+    if ($node) {
+        $npm = Join-Path (Split-Path $node -Parent) 'npm.cmd'
+        if (Test-Path $npm) {
+            # 该调用去掉 2>$null（PS 5.1 下重定向的原生命令 stderr 会变成终止性异常，导致一键启动器
+            # 无提示地中断），改为临时放宽 ErrorActionPreference，npm 的 WARN/notice 不影响找路径。
+            $eap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try { $globalRoot = (& $npm root -g | Select-Object -Last 1) }
+            finally { $ErrorActionPreference = $eap }
+            if ($globalRoot -and (Test-Path $globalRoot)) {
+                $bin = Join-Path $globalRoot '@deepseek-ai\dsh\lib\bin.js'
+                if (Test-Path $bin) { return (Resolve-Path $bin).Path }
+            }
+        }
+    }
+    # 3. npx 缓存（旧版安装布局，向后兼容）
+    if ($env:LOCALAPPDATA) {
+        $npxRoot = Join-Path $env:LOCALAPPDATA 'npm-cache\_npx'
+        if (Test-Path $npxRoot) {
+            $dirs = Get-ChildItem $npxRoot -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending
+            foreach ($d in $dirs) {
+                $cand = Join-Path $d.FullName 'node_modules\@deepseek-ai\dsh\lib\bin.js'
+                if (Test-Path $cand) { return (Resolve-Path $cand).Path }
+            }
         }
     }
     return $null
@@ -109,15 +158,19 @@ if (-not $node)  { Write-Log '未找到 node.exe';  exit 1 }
 if (-not $binJs) { Write-Log '未找到 dsh（@deepseek-ai/dsh）安装。'; exit 1 }
 
 Write-Log "启动服务：node $binJs web --host $HostName --port $Port"
-$args = @('"' + $binJs + '"', 'web', '--host', $HostName, '--port', "$Port")
-Start-Process -FilePath $node -ArgumentList $args -WorkingDirectory $Root `
-    -WindowStyle Hidden -RedirectStandardOutput $OutFile -RedirectStandardError $ErrFile | Out-Null
+# 用单条命令行字符串传参（内部已引号包裹 binJs），规避 PS5.1/PS7 对 -ArgumentList 数组
+# 引号策略不一致导致含空格路径传错的问题；同时不再覆盖自动变量 $args
+$cmdLine = '"' + $binJs + '" web --host ' + $HostName + ' --port ' + $Port
+$proc = Start-Process -FilePath $node -ArgumentList $cmdLine -WorkingDirectory $Root `
+    -WindowStyle Hidden -RedirectStandardOutput $OutFile -RedirectStandardError $ErrFile -PassThru
 
-# 轮询等待就绪
+# 轮询等待就绪（进程即退则快速失败，不空等满 120s）
 $deadline = (Get-Date).AddSeconds(120)
 $ready = $false
+$procExited = $false
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
+    if ($proc.HasExited) { $procExited = $true; break }
     if (Test-DshRunning) { $ready = $true; break }
 }
 
@@ -126,11 +179,18 @@ if ($ready) {
     if (-not $NoBrowser) { Start-Process $Url | Out-Null; Write-Log '已打开浏览器。' }
     exit 0
 } else {
-    Write-Log '服务在 120 秒内未就绪，请查看日志。'
+    # 失败/超时：不再把浏览器打开到未就绪的 URL
     Add-Type -AssemblyName System.Windows.Forms
-    [System.Windows.Forms.MessageBox]::Show(
-        "DeepSeek Harness 启动超时（120 秒）。`n`n日志：$LogFile`n错误：$ErrFile",
-        'DeepSeek Harness', 'OK', 'Error') | Out-Null
-    if (-not $NoBrowser) { Start-Process $Url | Out-Null }
+    if ($procExited) {
+        Write-Log "dsh 进程启动后立即退出（退出码 $($proc.ExitCode)）。请查看：$ErrFile"
+        [System.Windows.Forms.MessageBox]::Show(
+            "dsh 启动失败：进程已退出（退出码 $($proc.ExitCode)）。`n`n错误日志：$ErrFile",
+            'DeepSeek Harness', 'OK', 'Error') | Out-Null
+    } else {
+        Write-Log '服务在 120 秒内未就绪，请查看日志。'
+        [System.Windows.Forms.MessageBox]::Show(
+            "DeepSeek Harness 启动超时（120 秒）。`n`n日志：$LogFile`n错误：$ErrFile",
+            'DeepSeek Harness', 'OK', 'Error') | Out-Null
+    }
     exit 1
 }

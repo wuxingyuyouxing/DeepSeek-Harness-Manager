@@ -29,8 +29,8 @@ using Timer = System.Windows.Forms.Timer;
 [assembly: AssemblyProduct("DeepSeek Harness Manager")]
 [assembly: AssemblyCompany("DeepSeek Harness")]
 [assembly: AssemblyCopyright("Copyright © 2026 DeepSeek Harness")]
-[assembly: AssemblyVersion("1.2.5.0")]
-[assembly: AssemblyFileVersion("1.2.5.0")]
+[assembly: AssemblyVersion("1.2.6.0")]
+[assembly: AssemblyFileVersion("1.2.6.0")]
 
 namespace DshManager
 {
@@ -73,14 +73,21 @@ namespace DshManager
                 return;
             }
 
-
+            // 单实例保护：静态持有互斥体直到进程退出，避免局部变量被 GC 回收后保护失效
             bool createdNew;
-            Mutex mutex = new Mutex(true, "DeepSeekHarnessManager.SingleInstance", out createdNew);
+            SingleMutex = new Mutex(true, "DeepSeekHarnessManager.SingleInstance", out createdNew);
             if (!createdNew) return; // 已有一个实例
 
             Settings.Load();
             CleanupOldLogs(); // 清理 30 天前的旧日志，避免 logs 目录无限增长
             Application.Run(new AppContext(minimized));
+        }
+
+        static Mutex SingleMutex; // 静态持有，防止被 GC 释放导致"单实例"失效
+
+        public static void ReleaseSingleMutex()
+        {
+            try { if (SingleMutex != null) { SingleMutex.ReleaseMutex(); } } catch { }
         }
 
         // 删除 logs 目录下超过 30 天的日志文件
@@ -132,7 +139,7 @@ namespace DshManager
     // ───────────────────────────────────────────────────────────── 轻量动画器（UI 线程，16ms/帧）
     static class Anim
     {
-        class Run { public float t; public float dur; public Action<float> tick; public Action done; }
+        class Run { public float dur; public long start; public Action<float> tick; public Action done; }
         static Timer timer;
         static List<Run> runs = new List<Run>();
 
@@ -144,17 +151,20 @@ namespace DshManager
                 timer.Interval = 16;
                 timer.Tick += delegate { Tick(); };
             }
-            runs.Add(new Run { t = 0f, dur = durMs, tick = tick, done = done });
+            runs.Add(new Run { dur = durMs, start = Environment.TickCount, tick = tick, done = done });
             if (!timer.Enabled) timer.Start();
         }
 
         static void Tick()
         {
+            // 用真实流逝时间计算进度（不再假定 16ms/帧），系统定时器频率变化时动画速度仍准确
+            long now = Environment.TickCount;
             for (int i = runs.Count - 1; i >= 0; i--)
             {
                 Run r = runs[i];
-                r.t += 16f;
-                float p = Math.Min(1f, r.t / r.dur);
+                long elapsed = now - r.start;
+                if (elapsed < 0) elapsed = (long)r.dur; // TickCount 回绕（约 49.7 天）：按已完成处理，避免动画永不结束
+                float p = Math.Min(1f, (float)elapsed / r.dur);
                 try { if (r.tick != null) r.tick(p); } catch { }
                 if (p >= 1f)
                 {
@@ -324,29 +334,38 @@ namespace DshManager
         [StructLayout(LayoutKind.Sequential)]
         struct MibTcpRowOwnerPid { public uint state, localAddr, localPort, remoteAddr, remotePort, owningPid; }
 
-        // 返回监听指定端口的进程 PID；无则 0
+        // 返回监听指定端口的进程 PID；0 = 端口上没有监听者；-1 = 查询失败（区别于"没有监听者"，
+        // 调用方据此决定能否做"无监听=已停止"的快速判定）
         public static int GetPidByPort(int port)
         {
-            const int AF_INET = 2, TCP_TABLE_OWNER_PID_ALL = 5;
-            int size = 0;
-            GetExtendedTcpTable(IntPtr.Zero, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-            if (size <= 0) return 0;
-            IntPtr buf = Marshal.AllocHGlobal(size);
-            try
+            const int AF_INET = 2, TCP_TABLE_OWNER_PID_ALL = 5, ERROR_INSUFFICIENT_BUFFER = 122;
+            // 两次调用协议：先取所需缓冲区大小，再取数据。两次调用之间 TCP 表可能增长，
+            // 此时第二次调用返回 ERROR_INSUFFICIENT_BUFFER——必须重试，否则会被误判成"端口上没有监听者"。
+            for (int attempt = 0; attempt < 3; attempt++)
             {
-                if (GetExtendedTcpTable(buf, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != 0) return 0;
-                int num = Marshal.ReadInt32(buf);
-                int stride = Marshal.SizeOf(typeof(MibTcpRowOwnerPid));
-                for (int i = 0; i < num; i++)
+                int size = 0;
+                GetExtendedTcpTable(IntPtr.Zero, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+                if (size <= 0) return -1;
+                IntPtr buf = Marshal.AllocHGlobal(size);
+                try
                 {
-                    IntPtr row = new IntPtr(buf.ToInt64() + 4 + (long)i * stride);
-                    MibTcpRowOwnerPid r = (MibTcpRowOwnerPid)Marshal.PtrToStructure(row, typeof(MibTcpRowOwnerPid));
-                    ushort p = (ushort)((r.localPort >> 8) | ((r.localPort & 0xFF) << 8));
-                    if (p == (ushort)port && r.state == 2) return (int)r.owningPid; // 2 = LISTEN
+                    uint rc = GetExtendedTcpTable(buf, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+                    if (rc == ERROR_INSUFFICIENT_BUFFER) continue;
+                    if (rc != 0) return -1;
+                    int num = Marshal.ReadInt32(buf);
+                    int stride = Marshal.SizeOf(typeof(MibTcpRowOwnerPid));
+                    for (int i = 0; i < num; i++)
+                    {
+                        IntPtr row = new IntPtr(buf.ToInt64() + 4 + (long)i * stride);
+                        MibTcpRowOwnerPid r = (MibTcpRowOwnerPid)Marshal.PtrToStructure(row, typeof(MibTcpRowOwnerPid));
+                        ushort p = (ushort)((r.localPort >> 8) | ((r.localPort & 0xFF) << 8));
+                        if (p == (ushort)port && r.state == 2) return (int)r.owningPid; // 2 = LISTEN
+                    }
+                    return 0; // 查询成功且无监听者
                 }
+                finally { Marshal.FreeHGlobal(buf); }
             }
-            finally { Marshal.FreeHGlobal(buf); }
-            return 0;
+            return -1; // 重试后仍拿不到稳定的表
         }
     }
 
@@ -375,7 +394,6 @@ namespace DshManager
     class SettingsData
     {
         public string Theme = "light";
-        public bool Glass = false; // 默认关闭：部分 Win10 上亚克力渲染为黑色，实色底色更稳定
         public bool Autostart = false;
         public bool CloseExits = false;
         public string NodePath = ""; // 用户手动指定的 node.exe（可选，适配非标准安装）
@@ -478,6 +496,15 @@ namespace DshManager
         public Process Proc;
         public StreamWriter SwOut, SwErr;
         public string AuthUrl = ""; // dsh 0.1.2-rc+ 启动时打印的带令牌访问 URL（http://host:port/?token=...）
+        public readonly object LogLock = new object(); // 保护 SwOut/SwErr 的写入与 Dispose，避免回调线程与 Stop/Detect 并发
+        public long DetectSeq;       // 已发出的探测序号（仅 UI 线程读写）
+        public long DetectApplied;   // 已回写 UI 的最大探测序号（仅 UI 线程读写）：丢弃更旧的乱序结果
+        public bool Detecting;       // 是否已有探测在途（仅 UI 线程读写）：避免同一实例探测叠加
+        public int DetectStart;      // 在途探测的发起时刻（Environment.TickCount，仅 UI 线程读写）
+
+        // 作废所有在途探测结果（启停/安装等已直接改状态的操作前调用）：
+        // 把"已回写序号"抬到当前发出的序号之上，任何此前发出的探测回来都会被丢弃。
+        public void InvalidateProbes() { DetectApplied = ++DetectSeq; }
     }
 
     static class DshService
@@ -664,7 +691,7 @@ namespace DshManager
             try
             {
                 int pid = rt.Pid != 0 ? rt.Pid : Native.GetPidByPort(rt.Cfg.Port);
-                if (pid == 0) return;
+                if (pid <= 0) return; // <=0：没有监听者，或 TCP 表查询失败（-1）
                 string cmd = GetProcessCommandLine(pid);
                 string node, dsh;
                 ParseLaunchCommand(cmd, out node, out dsh);
@@ -914,16 +941,24 @@ namespace DshManager
                 });
                 for (int i = files.Length - 1; i >= 0 && rt.AuthUrl.Length == 0; i--)
                 {
-                    string[] ls = File.ReadAllLines(files[i]);
-                    foreach (string l in ls)
+                    try
                     {
-                        Match m = Regex.Match(l, @"https?://[^\s'""><\u001b]+");
-                        if (m.Success && m.Value.IndexOf("?token=", StringComparison.Ordinal) >= 0)
+                        // 日志文件可能正被管理器自己的 StreamWriter(FileShare.ReadWrite) 写入：
+                        // File.ReadAllLines 默认 FileShare.Read 会撞共享冲突抛 IOException（被外层吞掉，
+                        // 兜底抓令牌实际失效）。必须用 FileShare.ReadWrite 流式读。
+                        using (FileStream fs = new FileStream(files[i], FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
                         {
-                            rt.AuthUrl = m.Value;
-                            break;
+                            string l;
+                            while (rt.AuthUrl.Length == 0 && (l = sr.ReadLine()) != null)
+                            {
+                                Match m = Regex.Match(l, @"https?://[^\s'""><\u001b]+");
+                                if (m.Success && m.Value.IndexOf("?token=", StringComparison.Ordinal) >= 0)
+                                    rt.AuthUrl = m.Value;
+                            }
                         }
                     }
+                    catch { }
                 }
             }
             catch { }
@@ -940,25 +975,50 @@ namespace DshManager
             return !Regex.IsMatch(v, @"^0\.1\.\d+-rc", RegexOptions.IgnoreCase);
         }
 
+        // 绑定地址是否为 IPv4 字面量（127.0.0.1 / 0.0.0.0 / 192.168.x.x …）。
+        // 只有 IPv4 字面量才可用 IPv4 TCP 表判定"端口上有没有监听者"；主机名/IPv6 监听
+        // 不出现在 IPv4 表中，此时必须走 HTTP 探测，否则会误报"已停止"。
+        static bool IsIpv4Literal(string host)
+        {
+            IPAddress a;
+            return IPAddress.TryParse(host, out a) && a.AddressFamily == AddressFamily.InterNetwork;
+        }
+
         public static SvcState Detect(InstanceRuntime rt)
         {
             try
             {
                 if (rt.Proc != null && rt.Proc.HasExited)
                 {
+                    try { rt.Proc.Dispose(); } catch { }
                     rt.Proc = null;
-                    if (rt.SwOut != null) { try { rt.SwOut.Dispose(); } catch { } rt.SwOut = null; }
-                    if (rt.SwErr != null) { try { rt.SwErr.Dispose(); } catch { } rt.SwErr = null; }
+                    lock (rt.LogLock)
+                    {
+                        if (rt.SwOut != null) { try { rt.SwOut.Dispose(); } catch { } rt.SwOut = null; }
+                        if (rt.SwErr != null) { try { rt.SwErr.Dispose(); } catch { } rt.SwErr = null; }
+                    }
                 }
+
+                // 先读本机 TCP 监听表判断端口有没有监听者（本地 API，耗时 ~0ms）。
+                // 没有监听者时不必再做 HTTP 探测：向未监听的端口发 HTTP 请求要等 TCP 连接失败，
+                // 本机实测单次约 2.05s（长于 2s 轮询间隔），正是"未启动服务时一直显示检测中"的成因。
+                // pid < 0 = 查询失败：此时不能断言"端口无人监听"，退回 HTTP 探测保证不漏判。
+                int pid = Native.GetPidByPort(rt.Cfg.Port);
+                if (pid == 0 && IsIpv4Literal(rt.Cfg.Host))
+                {
+                    if (rt.Proc != null) return SvcState.Starting; // 进程已起但尚未监听：仍在启动中
+                    rt.Pid = 0;
+                    return SvcState.Stopped;
+                }
+
                 if (Probe(rt.AuthUrl.Length > 0 ? rt.AuthUrl : rt.Cfg.Url))
                 {
-                    if (rt.Pid == 0) rt.Pid = Native.GetPidByPort(rt.Cfg.Port);
+                    if (rt.Pid == 0 && pid > 0) rt.Pid = pid;
                     EnsureAuthUrl(rt); // 补抓带令牌 URL（启动时漏抓/管理器重启后服务已在跑）
                     return SvcState.Running;
                 }
                 if (rt.Proc != null) return SvcState.Starting;
-                int pid = Native.GetPidByPort(rt.Cfg.Port);
-                if (pid != 0)
+                if (pid > 0)
                 {
                     rt.Pid = pid;
                     return SvcState.Occupied;
@@ -1007,19 +1067,36 @@ namespace DshManager
 
                 p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
                 {
-                    if (e.Data == null) return;
-                    if (rt.SwOut != null) { lock (rt.SwOut) rt.SwOut.WriteLine(e.Data); }
-                    // dsh 0.1.2-rc+ 启动时打印带令牌 URL（http://host:port/?token=...），捕获供探测/打开浏览器使用
-                    if (rt.AuthUrl.Length == 0)
+                    try
                     {
-                        Match m = Regex.Match(e.Data, @"https?://[^\s'""><\u001b]+");
-                        if (m.Success && m.Value.IndexOf("?token=", StringComparison.Ordinal) >= 0)
-                            rt.AuthUrl = m.Value;
+                        if (e.Data == null) return;
+                        // 写日志与 Stop/Detect 的 Dispose 可能并发：锁内判空，且整体 try/catch，
+                        // 避免 .NET 4.8 线程池线程上的未处理异常终止管理器进程
+                        lock (rt.LogLock)
+                        {
+                            if (rt.SwOut != null) rt.SwOut.WriteLine(e.Data);
+                        }
+                        // dsh 0.1.2-rc+ 启动时打印带令牌 URL（http://host:port/?token=...），捕获供探测/打开浏览器使用
+                        if (rt.AuthUrl.Length == 0)
+                        {
+                            Match m = Regex.Match(e.Data, @"https?://[^\s'""><\u001b]+");
+                            if (m.Success && m.Value.IndexOf("?token=", StringComparison.Ordinal) >= 0)
+                                rt.AuthUrl = m.Value;
+                        }
                     }
+                    catch { }
                 };
                 p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
                 {
-                    if (e.Data != null && rt.SwErr != null) { lock (rt.SwErr) rt.SwErr.WriteLine(e.Data); }
+                    try
+                    {
+                        if (e.Data == null) return;
+                        lock (rt.LogLock)
+                        {
+                            if (rt.SwErr != null) rt.SwErr.WriteLine(e.Data);
+                        }
+                    }
+                    catch { }
                 };
                 p.BeginOutputReadLine();
                 p.BeginErrorReadLine();
@@ -1036,11 +1113,22 @@ namespace DshManager
 
         public static void Stop(InstanceRuntime rt, bool manual)
         {
+            // 先取本地引用并摘掉 rt.Proc：在途探测（Detect）可能同时检查/Dispose 并置空 rt.Proc，
+            // 直接用 rt.Proc 会在"判空之后、使用之前"变成 null 抛异常，
+            // 而下面整体是一个 try/catch —— 异常会导致 taskkill/ManualStopped 全被跳过。
+            Process proc = rt.Proc;
+            rt.Proc = null;
+            // 手动停止的标记在 UI 线程（StopAsync）已先置位；这里再兜一次，逻辑与 manual 参数一致
+            if (manual) rt.Cfg.ManualStopped = true;
             try
             {
                 int pid = 0;
-                if (rt.Proc != null && !rt.Proc.HasExited) pid = rt.Proc.Id;
-                else pid = Native.GetPidByPort(rt.Cfg.Port);
+                if (proc != null && !proc.HasExited) pid = proc.Id;
+                else
+                {
+                    int byPort = Native.GetPidByPort(rt.Cfg.Port);
+                    if (byPort > 0) pid = byPort; // -1 = 查询失败，不做处理
+                }
                 if (pid != 0)
                 {
                     try
@@ -1054,16 +1142,19 @@ namespace DshManager
                     }
                     catch { }
                 }
-                if (rt.Proc != null)
+                if (proc != null)
                 {
-                    try { rt.Proc.Kill(); } catch { }
-                    try { rt.Proc.WaitForExit(2000); } catch { }
-                    rt.Proc = null;
+                    try { proc.CancelOutputRead(); proc.CancelErrorRead(); } catch { }
+                    try { proc.Kill(); } catch { }
+                    try { proc.WaitForExit(2000); } catch { }
+                    try { proc.Dispose(); } catch { }
                 }
-                if (rt.SwOut != null) { try { rt.SwOut.Dispose(); } catch { } rt.SwOut = null; }
-                if (rt.SwErr != null) { try { rt.SwErr.Dispose(); } catch { } rt.SwErr = null; }
+                lock (rt.LogLock)
+                {
+                    if (rt.SwOut != null) { try { rt.SwOut.Dispose(); } catch { } rt.SwOut = null; }
+                    if (rt.SwErr != null) { try { rt.SwErr.Dispose(); } catch { } rt.SwErr = null; }
+                }
                 rt.Pid = 0;
-                if (manual) rt.Cfg.ManualStopped = true;
             }
             catch { }
         }
@@ -1258,7 +1349,6 @@ namespace DshManager
 
             if (cmd == "doctor")
             {
-                DshService.Resolve();
                 // 标准查找失败时，尝试从指定端口正在运行的实例反向发现（适配源码仓库/自建安装）
                 if (DshService.NodeExe.Length == 0 || DshService.BinJs.Length == 0)
                 {
@@ -1406,7 +1496,7 @@ namespace DshManager
 
     class PillButton : BaseControl
     {
-        public enum Variant { Primary, Ghost, Danger, GhostDanger }
+        public enum Variant { Primary, Ghost }
         public Variant Kind = Variant.Primary;
         public string Glyph = "";
         public string Label = "";
@@ -1459,12 +1549,6 @@ namespace DshManager
                 case Variant.Ghost:
                     fill = Color.FromArgb((int)(ColorX.Lerp(Color.FromArgb(0, 0, 0, 0), T.SurfaceAlt, Math.Max(hoverP, downP)).A), T.SurfaceAlt.R, T.SurfaceAlt.G, T.SurfaceAlt.B);
                     text = T.Text; border = T.BorderStrong; break;
-                case Variant.Danger:
-                    fill = ColorX.Lerp(T.Err, Color.FromArgb(220, 66, 66), Math.Max(hoverP, downP));
-                    text = Color.White; border = Color.Empty; break;
-                case Variant.GhostDanger:
-                    fill = Color.FromArgb((int)(ColorX.Lerp(Color.FromArgb(0, 0, 0, 0), T.SurfaceAlt, hoverP).A), T.SurfaceAlt.R, T.SurfaceAlt.G, T.SurfaceAlt.B);
-                    text = T.Err; border = T.BorderStrong; break;
             }
             // 禁用态：弱化文字与填充，让用户明确感知按钮不可点
             if (!Enabled)
@@ -1521,7 +1605,6 @@ namespace DshManager
         }
         public event EventHandler Changed;
         public string Label = "";
-        public string Hint = "";
 
         float knobP; // 0=关, 1=开（动画插值）
 
@@ -1965,10 +2048,20 @@ namespace DshManager
                     return;
                 }
                 if (tbName.Text.Trim().Length == 0) tbName.Text = "实例";
+                string host = tbHost.Text.Trim();
+                if (host.Length == 0) host = "127.0.0.1";
+                // 绑定地址仅允许主机名/IP 字符，防止拼入启动命令时注入额外参数。
+                // 注意：该值会原样传给 `dsh web --host`，而 DSH 0.1.x 只接受 127.0.0.1 / 0.0.0.0，
+                // 填主机名或 IPv6 会被 dsh 拒绝启动，因此提示里明确只推荐 127.0.0.1。
+                if (!Regex.IsMatch(host, @"^[A-Za-z0-9\.\-:\[\]]+$"))
+                {
+                    MessageBox.Show(this, "绑定地址只能包含字母、数字、点、横线、冒号。\n推荐使用 127.0.0.1（DSH 当前版本仅支持 127.0.0.1 / 0.0.0.0）。",
+                        "输入有误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
                 Result = new InstanceConfig();
                 Result.Name = tbName.Text.Trim();
-                Result.Host = tbHost.Text.Trim();
-                if (Result.Host.Length == 0) Result.Host = "127.0.0.1";
+                Result.Host = host;
                 Result.Port = port;
                 Result.AutoOpenBrowser = swOpen.Checked;
                 Result.Watchdog = swWatch.Checked;
@@ -2021,6 +2114,7 @@ namespace DshManager
         bool firstHide = true;
         bool themeAnimating;
         bool installingDsh; // 防止「一键安装 dsh」重复点击
+        bool resolveKicked; // 环境卡首次后台解析 node/dsh 已触发（防止每 2s 轮询重复触发）
 
         // 关于页
         SectionLabel lblAboutDshVer, lblAboutDshStatus, lblAboutMgrVer, lblAboutMgrStatus;
@@ -2088,6 +2182,11 @@ namespace DshManager
             if (minimized) { Hide(); }
             else { Show(); }
 
+            // 启动即刷新当前实例信息与设置，无需等首次轮询（~2s）或手动点击实例
+            UpdateSelectedUi();
+            RefreshSettings();
+            PollStates(); // 立即探测一次：状态（运行/停止）在 ~100ms 内就绪，几乎不出现"检测中"
+
             AutoCheckUpdates(); // 启动后静默检查一次 dsh/管理器更新（异步，失败静默）
         }
 
@@ -2130,6 +2229,9 @@ namespace DshManager
         {
             reallyExit = true;
             try { tray.Visible = false; } catch { }
+            try { pollTimer.Stop(); logTimer.Stop(); watchTimer.Stop(); } catch { }
+            try { pollTimer.Dispose(); logTimer.Dispose(); watchTimer.Dispose(); } catch { }
+            try { tray.Dispose(); trayMenu.Dispose(); } catch { }
             Close();
         }
 
@@ -2221,6 +2323,11 @@ namespace DshManager
             contentPanel.Controls.Add(BuildDiag());
             contentPanel.Controls.Add(BuildAbout());
             contentPanel.Controls.Add(tabBar);
+
+            // 初始只显示激活页：否则 5 个 Fill 页全部 Visible 叠在一起，
+            // 实际最上层显示的页面与标签栏高亮不一致（首页"空白"、需点击后才刷新）
+            foreach (KeyValuePair<string, Control> kv in tabPages)
+                kv.Value.Visible = (kv.Key == activeTab);
 
             // 标签栏
             BuildTabBar();
@@ -2332,6 +2439,7 @@ namespace DshManager
             del.Click += delegate { DeleteInstance(rt); };
             m.Items.Add(edit);
             m.Items.Add(del);
+            m.Closed += delegate { m.Dispose(); };
             m.Show(host, at);
         }
 
@@ -2341,7 +2449,12 @@ namespace DshManager
             RefreshSidebar();
             RefreshOverview();
             RefreshSettings();
+            // 切换实例需重置日志位置：否则 logPos/logFile 仍指向旧实例 EOF，
+            // 切回时 RefreshLogs 读到"0 新增内容"，页面会显示空白
             logView.ClearAll();
+            logPos.Clear();
+            logFile.Clear();
+            logCarry.Clear();
         }
 
         void RefreshSidebar()
@@ -2402,6 +2515,11 @@ namespace DshManager
             DialogResult dr = MessageBox.Show(this, "删除实例「" + rt.Cfg.Name + "」？不会停止其正在运行的服务。", "确认删除",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (dr != DialogResult.Yes) return;
+            if (rt.Busy)
+            {
+                MessageBox.Show(this, "该实例正在启动/停止/安装中，请稍后再删除。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
             runtimes.Remove(rt);
             Settings.Data.Instances.Remove(rt.Cfg);
             Settings.Save();
@@ -2713,7 +2831,7 @@ namespace DshManager
             btnClear.Label = "清空显示";
             btnClear.Location = new Point((int)Ui.P(170), (int)Ui.P(7));
             btnClear.Size = new Size((int)Ui.P(84), (int)Ui.P(32));
-            btnClear.Click += delegate { logView.ClearAll(); };
+            btnClear.Click += delegate { logView.ClearAll(); logPos.Clear(); logFile.Clear(); logCarry.Clear(); };
             bar.Controls.Add(btnClear);
 
             PillButton btnOpen = new PillButton();
@@ -3188,7 +3306,7 @@ namespace DshManager
             lblEnvInfo.ForeColor = Theme.Current.TextMuted;
             lblEnvInfo.Font = new Font("Consolas", 9f);
             lblEnvInfo.Location = new Point((int)Ui.P(34), (int)Ui.P(272));
-            lblEnvInfo.Size = new Size((int)Ui.P(560), (int)Ui.P(64));
+            lblEnvInfo.Size = new Size((int)Ui.P(560), (int)Ui.P(84)); // 容纳 DSH_WEB_URL/提示等更多行
             page.Controls.Add(lblEnvInfo);
 
             PillButton btnLogOpen = new PillButton();
@@ -3340,15 +3458,19 @@ namespace DshManager
             }
             lblAboutMgrStatus.Invalidate();
 
-            // 运行环境
+            // 运行环境（完整信息放这里，不限行数；概览卡只保留两行摘要）
             string home = Environment.GetEnvironmentVariable("DSH_HOME");
             bool homeExplicit = !string.IsNullOrEmpty(home);
             if (!homeExplicit) home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
-            lblEnvInfo.Text = "node " + (DshService.NodeVersion.Length > 0 ? DshService.NodeVersion : "未知")
+            string url = Environment.GetEnvironmentVariable("DSH_WEB_URL");
+            string envInfo = "node " + (DshService.NodeVersion.Length > 0 ? DshService.NodeVersion : "未知")
                 + "    dsh " + (localDsh != "未知" ? localDsh : "未知")
                 + "    DSH_HOME: " + home + (homeExplicit ? "" : "（默认）") + "\n"
+                + (!string.IsNullOrEmpty(url) ? "DSH_WEB_URL: " + url + "\n" : "") // 环境变量可能不存在(null)，勿直接 .Length
                 + "应用目录: " + Settings.AppDir + "\n"
                 + "日志目录: " + Settings.LogsDir;
+            if (!homeExplicit) envInfo += "\n提示：DSH_HOME 未显式设置，可在系统环境变量中设置后重启管理器。";
+            lblEnvInfo.Text = envInfo;
 
             // 一键升级可用性：dsh 可升级（npm 全局安装 / npx 缓存安装）且确实发现新版才可点；
             // 已是最新 / 检查失败 / 版本未知 → 禁用（避免白跑一次安装）
@@ -3507,7 +3629,7 @@ namespace DshManager
                 });
             };
             try { wc.DownloadFileAsync(new Uri(UpdateService.ManagerLatestUrl), zipPath); }
-            catch (Exception ex) { FinishUpdateUi(btn, false, "无法开始下载：" + ex.Message); }
+            catch (Exception ex) { try { wc.Dispose(); } catch { } FinishUpdateUi(btn, false, "无法开始下载：" + ex.Message); }
         }
 
         // 下载/更新结束后的按钮与状态复位；err 为空表示成功进入重启
@@ -3645,13 +3767,33 @@ namespace DshManager
                     return;
                 }
             }
-            foreach (InstanceRuntime rt in toRestart)
+            // 停服在后台执行（taskkill 等待等可能数秒/实例），避免 UI 线程冻结；
+            // 停服完成后再回到 UI 线程开始安装（AppendDiag/计时器/RunStream 均需 UI 线程）
+            if (toRestart.Count == 0)
             {
-                rt.Busy = true;                 // 阻断看门狗轮询自动拉起
-                rt.Cfg.ManualStopped = true;    // 阻断看门狗（双保险）
-                DshService.Stop(rt, false);
-                rt.State = SvcState.Stopped;    // 立即反映到 UI（否则安装期间一直显示"运行中"）
+                StartInstallAfterStop(btn, doneLabel, targetVersion, toRestart);
             }
+            else
+            {
+                Task.Run(delegate
+                {
+                    foreach (InstanceRuntime rt in toRestart)
+                    {
+                        rt.Busy = true;              // 阻断看门狗轮询自动拉起
+                        rt.Cfg.ManualStopped = true; // 阻断看门狗（双保险）
+                        DshService.Stop(rt, false);
+                        SafeInvoke(delegate { rt.InvalidateProbes(); rt.State = SvcState.Stopped; UpdateSelectedUi(); });
+                    }
+                }).ContinueWith(delegate
+                {
+                    SafeInvoke(delegate { StartInstallAfterStop(btn, doneLabel, targetVersion, toRestart); });
+                }, TaskScheduler.Default);
+            }
+        }
+
+        // 停服完成后开始 npm 安装/升级（在 UI 线程执行）
+        void StartInstallAfterStop(PillButton btn, string doneLabel, string targetVersion, List<InstanceRuntime> toRestart)
+        {
             UpdateSelectedUi();
 
             // 显式指定目标版本：@deepseek-ai/dsh 只发 rc 预发布版，npm 的 latest 标签停在较早的 rc，
@@ -3691,6 +3833,7 @@ namespace DshManager
                 foreach (InstanceRuntime rt in toRestart)
                 {
                     if (rt == null) continue;
+                    if (!runtimes.Contains(rt)) continue; // 安装期间该实例可能已被删除，不再拉起
                     rt.Busy = false;
                     rt.Cfg.ManualStopped = false;
                     StartAsync(rt);
@@ -3823,44 +3966,68 @@ namespace DshManager
             foreach (InstanceRuntime rt in runtimes)
             {
                 if (rt.Busy) continue;
+                // 上一轮探测还没回来：本轮跳过，避免探测叠加与结果乱序。
+                // 但探测本身可能卡住（WMI 拿命令行、主机名配置下的慢解析），若超过 30s 仍未回来，
+                // 视为该次探测已失效并重新发起，避免该实例的状态永久冻结在旧值上。
+                if (rt.Detecting)
+                {
+                    if (Environment.TickCount - rt.DetectStart < 30000) continue;
+                    rt.InvalidateProbes(); // 作废卡住的那次探测，其迟到结果不再回写
+                    rt.Detecting = false;
+                }
+                rt.Detecting = true;        // 以下 Detecting/DetectSeq/DetectApplied/DetectStart 只在 UI 线程读写
+                rt.DetectStart = Environment.TickCount;
+                long seq = ++rt.DetectSeq;
+                InstanceRuntime cap = rt;
                 try
                 {
                     Task.Run(delegate
                     {
-                        SvcState st = DshService.Detect(rt);
+                        SvcState st = SvcState.Error;
                         long mem = 0;
                         DateTime started = DateTime.MinValue;
-                        if (st == SvcState.Running && rt.Pid != 0)
+                        try
                         {
-                            // 运行中：反向发现 node/dsh 并持久化（停止后重启仍可用，适配源码/自建安装）
-                            if (!rt.DiscTried)
+                            st = DshService.Detect(cap);
+                            if (st == SvcState.Running && cap.Pid != 0)
                             {
-                                DshService.DiscoverFromRunning(rt);
-                            }
-                            try
-                            {
-                                using (Process p = Process.GetProcessById(rt.Pid))
+                                // 运行中：反向发现 node/dsh 并持久化（停止后重启仍可用，适配源码/自建安装）
+                                if (!cap.DiscTried)
                                 {
-                                    mem = p.WorkingSet64 / (1024 * 1024);
-                                    started = p.StartTime;
+                                    DshService.DiscoverFromRunning(cap);
                                 }
+                                try
+                                {
+                                    using (Process p = Process.GetProcessById(cap.Pid))
+                                    {
+                                        mem = p.WorkingSet64 / (1024 * 1024);
+                                        started = p.StartTime;
+                                    }
+                                }
+                                catch { }
                             }
-                            catch { }
                         }
+                        catch { }
                         SafeInvoke(delegate
                         {
-                            rt.State = st;
+                            cap.Detecting = false;
+                            // 只回写比"已回写序号"更新的结果：更旧的（探测慢/已被启停操作作废）直接丢弃。
+                            // 注意不能与"最新发出的序号"比较——若单次探测慢于轮询间隔，那样会永远丢弃，
+                            // 状态就永远停在"检测中…"。
+                            if (seq <= cap.DetectApplied) return;
+                            cap.DetectApplied = seq;
+                            cap.State = st;
                             if (st == SvcState.Running)
                             {
-                                rt.MemMb = mem;
-                                if (started != DateTime.MinValue) rt.StartedAt = started;
+                                cap.MemMb = mem;
+                                if (started != DateTime.MinValue) cap.StartedAt = started;
                             }
-                            if (st == SvcState.Stopped) rt.MemMb = 0;
+                            if (st == SvcState.Stopped) cap.MemMb = 0;
                             UpdateSelectedUi();
                         });
                     });
                 }
-                catch { }
+                catch { rt.Detecting = false; }
             }
         }
 
@@ -3892,7 +4059,7 @@ namespace DshManager
             Theme T = Theme.Current;
             SvcState st = selected.State;
 
-            string stText = "未知";
+            string stText = "检测中…"; // Unknown=启动后尚未完成首次探测
             switch (st)
             {
                 case SvcState.Running: stText = "运行中"; break;
@@ -3978,21 +4145,30 @@ namespace DshManager
             }
             if (stEnv != null)
             {
-                // 懒加载：首次展示环境信息时解析 node/dsh 版本（约 100-200ms，仅一次）
-                if (DshService.NodeExe.Length == 0) DshService.Resolve();
+                // 懒加载：首次展示环境信息时后台解析 node/dsh 版本
+                //（Resolve 内含两次最长 8s 的进程调用，不能在 UI 线程同步执行）
+                if (DshService.NodeExe.Length == 0 && !resolveKicked)
+                {
+                    resolveKicked = true;
+                    Task.Run(delegate
+                    {
+                        DshService.Resolve();
+                        SafeInvoke(delegate { RefreshOverview(); });
+                    });
+                }
                 string home = Environment.GetEnvironmentVariable("DSH_HOME");
                 bool homeExplicit = !string.IsNullOrEmpty(home);
                 if (!homeExplicit)
                 {
                     home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
                 }
-                string url = Environment.GetEnvironmentVariable("DSH_WEB_URL");
                 stEnv.Value = home;
-                string env = homeExplicit ? "DSH_HOME: 已显式设置" : "DSH_HOME 未显式设置，使用默认目录";
-                if (!string.IsNullOrEmpty(url)) env += "  ·  DSH_WEB_URL: " + url;
-                if (DshService.NodeExe.Length > 0 && DshService.NodeVersion.Length > 0) env += (env.Length > 0 ? "  ·  " : "") + "node " + DshService.NodeVersion;
-                if (DshService.BinJs.Length > 0 && DshService.DshVersion.Length > 0) env += (env.Length > 0 ? "  ·  " : "") + "dsh " + DshService.DshVersion;
-                stEnv.Sub = env;
+                // 卡片 Sub 区仅 2 行（超出会被裁切）：第 1 行 DSH_HOME 状态，第 2 行 node/dsh 版本
+                string env = homeExplicit ? "DSH_HOME 已显式设置" : "DSH_HOME 未显式设置 · 使用默认目录";
+                string ver = "node " + (DshService.NodeExe.Length > 0 && DshService.NodeVersion.Length > 0 ? DshService.NodeVersion : "未解析");
+                if (DshService.BinJs.Length > 0 && DshService.DshVersion.Length > 0)
+                    ver += " · dsh " + DshService.DshVersion;
+                stEnv.Sub = env + "\n" + ver;
                 stEnv.Invalidate();
             }
 
@@ -4007,7 +4183,7 @@ namespace DshManager
         {
             if (headPill == null || selected == null) return;
             headPill.State = selected.State;
-            string stText = "未知";
+            string stText = "检测中…"; // Unknown=启动后尚未完成首次探测
             switch (selected.State)
             {
                 case SvcState.Running: stText = "运行中"; break;
@@ -4040,6 +4216,8 @@ namespace DshManager
         // ── 日志 ──
         Dictionary<string, long> logPos = new Dictionary<string, long>();
         Dictionary<string, string> logFile = new Dictionary<string, string>();
+        Dictionary<string, byte[]> logCarry = new Dictionary<string, byte[]>(); // 跨轮询保留的 UTF-8 不完整尾部字节
+        const int LogChunk = 64 * 1024; // 单次最多读取的日志字节数（避免整读超大日志分配大数组）
         // ANSI 转义：颜色(CSI SGR)、光标移动/清屏(CSI)、OSC、其他 C1/双字节转义全部剔除，避免日志页出现乱码
         static readonly Regex AnsiRe = new Regex(
             "\u001b\\[[0-9;?]*[ -/]*[@-~]|\u001b\\][^\u0007\u001b]*(\u0007|\u001b\\\\)|\u001b[@-Z\\\\_-]");
@@ -4091,18 +4269,51 @@ namespace DshManager
                     using (FileStream fs = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                     {
                         if (fs.Length < pos) pos = 0;
-                        fs.Seek(pos, SeekOrigin.Begin);
-                        byte[] buf = new byte[fs.Length - pos];
-                        int read = fs.Read(buf, 0, buf.Length);
-                        if (read > 0)
+                        // 首次读到该文件时直接定位到末尾附近：单次只读 64KB，若从 0 开始续读，
+                        // 1MB 的历史日志要 ~20 秒才追上（旧版整读没这问题），用户会觉得日志"不动"
+                        bool skipped = false;
+                        if (firstLoad && fs.Length - pos > LogChunk)
                         {
-                            string text = Encoding.UTF8.GetString(buf, 0, read);
+                            pos = fs.Length - LogChunk;
+                            skipped = true;
+                        }
+                        fs.Seek(pos, SeekOrigin.Begin);
+                        if (skipped)
+                        {
+                            // 从中间开始会切到半行：跳到下一行边界，避免首行是残缺内容
+                            int b;
+                            while (pos < fs.Length && (b = fs.ReadByte()) >= 0)
+                            {
+                                pos++;
+                                if (b == '\n') break;
+                            }
+                            fs.Seek(pos, SeekOrigin.Begin);
+                        }
+                        // 单次最多读 64KB：超大日志不再一次性整读分配大数组，剩余内容下个周期续读
+                        int take = (int)Math.Min(fs.Length - pos, LogChunk);
+                        byte[] carry = null;
+                        logCarry.TryGetValue(key, out carry);
+                        byte[] buf = new byte[(carry != null ? carry.Length : 0) + take];
+                        if (carry != null) Buffer.BlockCopy(carry, 0, buf, 0, carry.Length);
+                        int got = fs.Read(buf, carry != null ? carry.Length : 0, take);
+                        int dataLen = (carry != null ? carry.Length : 0) + got;
+                        if (dataLen > 0)
+                        {
+                            // 保留末尾可能不完整的 UTF-8 多字节序列到下次，避免跨轮询截断产生乱码
+                            int tail = IncompleteUtf8Tail(buf, dataLen);
+                            byte[] newCarry = tail > 0 ? new byte[tail] : null;
+                            if (newCarry != null) Buffer.BlockCopy(buf, dataLen - tail, newCarry, 0, tail);
+                            logCarry[key] = newCarry;
+
+                            string text = Encoding.UTF8.GetString(buf, 0, dataLen - tail);
                             if (pos == 0 && text.Length > 0 && text[0] == '\uFEFF') text = text.Substring(1); // 去 BOM
                             text = AnsiRe.Replace(text, "");
                             string[] lines = text.Split('\n');
                             if (firstLoad && lines.Length > 0) // 每次运行一条分隔线，便于区分多次运行
                                 logView.AppendLine("──── " + Directory.GetLastWriteTime(f).ToString("yyyy-MM-dd HH:mm:ss")
                                     + (s.IsErr ? " · stderr ────" : " ────"), 0, false);
+                            if (firstLoad && skipped)
+                                logView.AppendLine("──── 已跳过更早内容，从最近 " + (LogChunk / 1024) + "KB 处开始显示 ────", 0, false);
                             foreach (string ln in lines)
                             {
                                 if (ln.Length == 0) continue;
@@ -4113,12 +4324,31 @@ namespace DshManager
                                 logView.AppendLine(ln.TrimEnd('\r'), level, s.IsErr);
                             }
                         }
-                        logPos[key] = pos + read;
+                        logPos[key] = pos + got;
                         logFile[key] = f;
                     }
                 }
                 catch { }
             }
+        }
+
+        // 计算字节块末尾不完整 UTF-8 多字节序列的字节数（0=末尾是完整字符/ASCII）
+        static int IncompleteUtf8Tail(byte[] b, int len)
+        {
+            int i = len;
+            int cont = 0;
+            while (i > 0 && (b[i - 1] & 0xC0) == 0x80) { cont++; i--; }
+            // 整块都是 continuation 字节 = 数据异常（日志里混入二进制）。最多只保留 3 个：
+            // 合法 UTF-8 序列的后续字节最多 3 个，返回 cont 会让 carry 每轮最多涨 64KB 且永远吐不出内容。
+            if (i == 0) return Math.Min(cont, 3);
+            int lead = b[i - 1];
+            int need;
+            if ((lead & 0xE0) == 0xC0) need = 2;
+            else if ((lead & 0xF0) == 0xE0) need = 3;
+            else if ((lead & 0xF8) == 0xF0) need = 4;
+            else return 0; // ASCII 或非法前导字节
+            int have = 1 + cont;
+            return have < need ? have : 0;
         }
 
         // ── 看门狗 ──
@@ -4146,6 +4376,7 @@ namespace DshManager
         {
             if (rt.Busy) return;
             rt.Busy = true;
+            rt.InvalidateProbes(); // 作废在途探测：避免旧结果在启动过程中把状态改回"已停止/运行中"
             rt.Cfg.ManualStopped = false;
             UpdateSelectedUi();
             Task.Run(delegate
@@ -4160,7 +4391,9 @@ namespace DshManager
                         Thread.Sleep(800);
                         st = DshService.Detect(rt);
                         if (st == SvcState.Running) break;
-                        if (st == SvcState.Occupied || st == SvcState.Error) break;
+                        // 快速跳出：端口被占用/探测出错，或进程已退出（新快速路径下 Stopped 即"子进程已消失"），
+                        // 不再空转满 90s 才告诉用户失败
+                        if (st == SvcState.Occupied || st == SvcState.Error || st == SvcState.Stopped) break;
                     }
                 }
                 else st = SvcState.Error;
@@ -4218,6 +4451,17 @@ namespace DshManager
                     }
                     else if (final == SvcState.Occupied)
                         MessageBox.Show(this, "端口 " + rt.Cfg.Port + " 已被其他进程占用。", "DeepSeek Harness", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    else if (final == SvcState.Stopped || final == SvcState.Starting)
+                    {
+                        // 启动超时 / 进程启动后即退出：如实反馈，避免状态悬在"启动中"无人知晓
+                        rt.FailCount++;
+                        if (!silent)
+                        {
+                            rt.Cfg.ManualStopped = true;
+                            MessageBox.Show(this, "服务未能启动（当前状态：" + (final == SvcState.Starting ? "仍在启动中，已超过 90 秒" : "进程已退出") + "）。\n请查看「日志」页了解详情。",
+                                "DeepSeek Harness", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        }
+                    }
                 });
             });
         }
@@ -4226,6 +4470,8 @@ namespace DshManager
         {
             if (rt.Busy) return;
             rt.Busy = true;
+            rt.InvalidateProbes(); // 作废在途探测：避免旧结果在停止过程中把状态改回"运行中"
+            rt.Cfg.ManualStopped = true; // 用户主动停止：立刻在 UI 线程置位，确保后置的停服逻辑异常也不会被看门狗拉起
             UpdateSelectedUi();
             Task.Run(delegate
             {
@@ -4245,6 +4491,7 @@ namespace DshManager
         {
             if (rt.Busy) return;
             rt.Busy = true;
+            rt.InvalidateProbes(); // 作废在途探测：避免旧结果在重启过程中回写陈旧状态
             UpdateSelectedUi();
             Task.Run(delegate
             {
@@ -4260,6 +4507,8 @@ namespace DshManager
                         Thread.Sleep(800);
                         st = DshService.Detect(rt);
                         if (st == SvcState.Running) break;
+                        // 快速跳出（含进程已退出=Stopped），避免失败时空转满 90s
+                        if (st == SvcState.Occupied || st == SvcState.Error || st == SvcState.Stopped) break;
                     }
                 }
                 else st = SvcState.Error;
@@ -4268,6 +4517,14 @@ namespace DshManager
                 {
                     rt.Busy = false;
                     rt.State = final;
+                    if (final != SvcState.Running)
+                    {
+                        rt.FailCount++;
+                        rt.Cfg.ManualStopped = true; // 失败后抑制看门狗自动重试
+                        string why = final == SvcState.Stopped ? "进程已退出" : (final == SvcState.Starting ? "仍在启动中，已超过 90 秒" : final.ToString());
+                        MessageBox.Show(this, "重启失败：服务未能启动（当前状态：" + why + "）。\n请查看「日志」页了解详情。",
+                            "DeepSeek Harness", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
                     UpdateSelectedUi();
                 });
             });
@@ -4298,7 +4555,7 @@ namespace DshManager
         public AppContext(bool minimized)
         {
             form = new MainForm(minimized);
-            form.FormClosed += delegate { ExitThread(); };
+            form.FormClosed += delegate { Program.ReleaseSingleMutex(); ExitThread(); };
         }
     }
 }

@@ -2,6 +2,135 @@
 
 版本规则：每次功能/修复变更都递增版本号（主程序与安装器保持同步），并在本文件补充说明。
 
+## v1.2.6（2026-09-10）
+
+### 修复（代码审查后加固）
+- **stdout/stderr 回调崩溃风险**：`OutputDataReceived/ErrorDataReceived` 回调在 .NET 4.8 线程池线程
+  执行且无 try/catch，而 `Stop`/`Detect` 会并发 Dispose+置空 `SwOut/SwErr` → 可能 NRE/
+  ObjectDisposedException，未处理异常会直接终止管理器进程。现回调整体 try/catch，写入与释放统一
+  用 `LogLock` 串行化，`Stop` 先 `CancelOutputRead/CancelErrorRead` 再释放。
+- **状态轮询乱序回写**：`PollStates` 每 2s 每实例一个探测任务，慢任务（Probe 超时+WMI）可能与新任务
+  重叠，SafeInvoke 无条件回写导致"停止后又显示运行中"、看门狗误判。现为每次探测分配序号，只回写
+  最新一次结果。
+- **`EnsureAuthUrl` 兜底失效**：用 `File.ReadAllLines`（FileShare.Read）读管理器自己
+  FileShare.ReadWrite 正写的日志会撞共享冲突，兜底抓令牌实际不生效。改为 FileShare.ReadWrite 流式读。
+- **日志页切换实例后空白**：`SelectInstance` 与「清空显示」只清空 LogView 未重置 `logPos/logFile`
+  位置字典，切回旧实例时"0 新增"显示空白。现切换/清空同步重置位置。
+- **启动/重启失败反馈**：`RestartAsync` 失败不再空转 90s（Occupied/Error 快速跳出），并弹窗提示+
+  递增 FailCount+抑制看门狗；`StartAsync` 超时或进程即退（Stopped/Starting）同样如实反馈。
+- **安装器卸载安全**：卸载前校验安装目录确为本程序目录（含主程序、非盘符根），删除失败如实提示并
+  保留注册表入口；解压增加 zip-slip 路径包含校验；`DisplayVersion` 由 AssemblyVersion 派生，
+  不再硬编码 1.2.1。
+- **一键启动器兼容 0.1.2-rc 鉴权**：`start-dsh.ps1` 的 `Test-DshRunning` 把"401 + authentication
+  required"也视为服务就绪（PS5.1/7 双兼容），不再误报启动超时。
+- **启动器脚本编码**：`release.ps1` 此前是 UTF-8 **无 BOM**（`build.ps1`/`start-dsh.ps1`/`stop-dsh.ps1`
+  自 v1.1.x 起已带 BOM），而 Windows PowerShell 5.1 会按系统 ANSI 读取无 BOM 脚本，中文注释/字符串
+  乱码会让整个脚本解析失败。现补齐 BOM：五个 `.ps1` 在 PS 5.1 与 PS 7 下
+  `Parser::ParseFile` 均 0 错误（已双解释器验证）。
+- **release.ps1 发布可靠性**：每个 git 步骤检查 `$LASTEXITCODE`，commit/push/tag 失败即中止，不再
+  吞错误继续创建 Release；重复发布同一 tag 会报错而非静默复用。
+- **release.ps1 在 Windows PowerShell 5.1 下必然发布失败**：脚本用 `Get-Content -Raw` 读
+  `README.md`/`CHANGELOG.md`，而这两个文件是 UTF-8 **无 BOM**，PS 5.1 默认按系统 ANSI(GBK) 解码 →
+  中文变乱码，发布前置校验必然误报"README 版本信息未同步"而中止（用 PS 7 跑才正常，所以之前没暴露）；
+  即便绕过校验，Release 说明也会是乱码。现两处读取显式加 `-Encoding UTF8`，并给创建 Release 的请求
+  加 `charset=utf-8`（PS 5.1 对字符串 body 默认非 UTF-8 编码）。另外 git 调用去掉了 `2>&1`/`2>$null`
+  重定向：PS 5.1 下被重定向的原生命令 stderr 会变成**终止性** RemoteException，会在 `git push` 成功
+  之后中断脚本，留下"tag 已推送但没有 Release"的半成品状态（此时重跑会卡在 tag 已存在）。
+
+### 健壮性/性能（Phase 3）
+- **安装不再冻结 UI**：`InstallDsh` 的停服循环（taskkill 等待可能数秒/实例）改到后台线程执行，
+  完成后回到 UI 线程开始安装；安装逻辑抽为 `StartInstallAfterStop`。
+- **删除实例保护**：实例正在启动/停止/安装（Busy）时禁止删除；`restoreInstances` 不再拉起安装期间
+  已被删除的实例。
+- **环境卡首次解析异步化**：`RefreshOverview` 首次解析 node/dsh 版本（内含两次最长 8s 的进程调用）
+  改后台执行并回刷，不再阻塞 UI 线程最多 16s。
+- **日志读取上限与 UTF-8 边界**：`RefreshLogs` 单次最多读 64KB（超大日志不再整读分配大数组），并
+  保留跨轮询的不完整 UTF-8 多字节尾部字节，消除跨读边界乱码。
+- **单实例互斥体静态持有**：Mutex 改静态字段并在退出时释放，避免局部变量被 GC 回收导致保护失效。
+- **资源释放**：右键实例菜单关闭后 Dispose；`UpdateManager` 下载异常路径释放 WebClient；`Stop`/
+  `Detect` 释放 Process 对象；`ReallyExit` 停止并释放 3 个 Timer 与托盘/菜单。
+- **动画用真实时间**：`Anim` 以 `Environment.TickCount` 计算进度，不再假定 16ms/帧，定时器频率变化
+  时动画速度仍准确。
+- **绑定地址输入校验**：实例编辑对话框限制 Host 仅含主机名/IP 字符，防止拼入启动命令时注入参数。
+- **死代码清理**：移除从未使用的 `SettingsData.Glass`、`SwitchControl.Hint`、`PillButton` 的
+  `Danger/GhostDanger` 变体（仅有 case 无赋值）、`Cli.Run` 中重复的 `Resolve()` 调用。
+- **构建脚本健壮性**：`build.ps1` 编译失败显式 `exit 1`（不再误报成功）；`build.ps1`/`release.ps1`
+  的 Node 下载改为从 `latest-v22.x` 目录动态解析版本号（不再钉死旧版本导致 404）并新增 SHA256 校验。
+- **签名时间戳会"静默失败"**：`release.ps1` 改用 `https://timestamp.digicert.com` 后，本机实测该 HTTPS
+  端点**既不抛异常也不加时间戳**（只按 `Get-AuthenticodeSignature` 的 `Status` 判断发现不了，而自签名
+  证书的 Status 恒为 `UnknownError`/`UntrustedRoot`），结果是发布产物没有时间戳——证书 2029 到期后
+  签名即失效（对比 v1.2.5 的产物是带时间戳的）。现改为 HTTPS → HTTP 依次尝试，并**逐个验证
+  `TimeStamperCertificate` 是否真的嵌入**，未盖上就明确告警；自签名根不受信任的 `UnknownError` 作为
+  预期提示（指向 `dist\数字签名说明.md`），不再误报为"签名异常"。
+- **便携包漏装「数字签名说明.md」**：`release.ps1` 的打包清单把该文件写成了绝对路径，而循环里又用
+  `Join-Path $root $f` 拼了一次，得到 `D:\...\D:\...\dist\数字签名说明.md`，`Test-Path` 失败后被
+  `continue` **静默跳过**——从 v1.1.x 起便携包里一直没有这份文档。现改为相对路径，且条目缺失不再静默
+  跳过而是告警。
+- **stop-dsh.ps1 收窄**：只停止"node 且命令行含 dsh/bin.js"的进程（不再误杀端口上无关 node 服务），
+  按 PID 去重（IPv4/IPv6 双监听），未停止任何服务时返回非零退出码。
+
+### 修复（发布前代码审查）
+- **Manager.cs（审查发现）**：
+  - **启动/重启失败仍空转 90 秒**：等待循环只对 `Running/Occupied/Error` 快速跳出，进程立即退出
+    （`Stopped`，如 `--host 0.0.0.0` 被拒、端口占用、崩溃）时会一直等到 90 秒超时才提示，与本节
+    "如实反馈失败"的说明矛盾。现 `Stopped` 也立即跳出并直接给出"进程已退出"提示。
+  - **`GetPidByPort` 把"查询失败"当成"端口无监听"**：TCP 表需两次调用（先取大小再取数据），两次之间
+    表增长会返回 `ERROR_INSUFFICIENT_BUFFER`，原实现一律返回 0；新增的"无监听=已停止"快速路径据此
+    会误报"已停止"（服务其实在跑），配合看门狗还可能重复拉起一个 dsh。现失败返回 -1 并重试，
+    `Detect` 只在"查询成功且无监听者"时才走快速路径，否则退回 HTTP 探测。
+  - **停止服务可能被整个跳过**：`Stop` 全程一个 try/catch，而"在途探测"会 `Dispose` 并置空
+    `rt.Proc`，判空后使用会抛异常 → taskkill 与 `ManualStopped` 全被跳过，用户刚停的服务可能被
+    看门狗拉起。现先把 `rt.Proc` 摘到本地引用再操作，并在 `StopAsync`（UI 线程）先置 `ManualStopped`。
+  - **探测卡住会永久冻结状态**：在途探测没有超时，`Detect` 一旦卡在 WMI/慢解析上，该实例状态就再也
+    不更新（看门狗据此误判）。现超过 30 秒作废该次探测并重新发起。
+  - **日志页首屏要几十秒才追上**：本版为限制内存改为单次最多读 64KB，导致首屏从文件开头续读
+    （1MB 日志 ≈ 20 秒才显示到最后）。现首次读到的文件直接定位到末尾 64KB 并对齐到行边界，
+    并显示"已跳过更早内容"提示。
+  - **`IncompleteUtf8Tail` 异常输入下 carry 无限增长**：整块都是 continuation 字节时原实现"全部保留"，
+    每轮最多把 carry 撑大 64KB 且永远吐不出内容；现最多保留 3 字节。
+  - **动画永不结束**：`Environment.TickCount` 约 49.7 天回绕时进度变负，页面淡入动画不会结束、
+    页面可能一直不可见；现回绕按已完成处理。绑定地址提示也不再建议 IPv6 方括号写法
+    （该值原样传给 `dsh web --host`，而 DSH 0.1.x 只接受 127.0.0.1 / 0.0.0.0）。
+- **release.ps1（审查发现）**：
+  - 前置校验从"Manager.cs → README"扩展到 **`tools\Setup.cs` 版本号**与 **CHANGELOG 顶部小节标题**：
+    Setup.cs 决定"添加或删除程序"里的 DisplayVersion，CHANGELOG 顶部小节会被原样发布为 Release
+    说明，漏改会静默发错版本（`-Version` 传参也因此被交叉校验）。
+  - `tag 已存在` 的报错补上补救命令（`git tag -d` / `git push origin :refs/tags/<tag>`），
+    避免半成品状态下无从下手；push 分支改为按当前分支（不再硬编码 `main`）。
+  - Node 便携包校验**不再 fail-open**：`SHASUMS256.txt` 里找不到对应条目时直接报错中止（此前只
+    Warning 后继续解压一个未校验的 34MB 压缩包），解压后还校验 `runtime\node\node.exe` 确实存在。
+- **stop-dsh.ps1 / start-dsh.ps1 / build.ps1（审查发现）**：`stop-dsh.ps1` 改用 `taskkill /T` 连
+  子进程一起停止（dsh 会派生子进程，旧写法会留下孤儿进程继续占端口），只在真正停止成功时才报告成功
+  （`Stop-Process` 失败被 `SilentlyContinue` 吞掉后仍打印"已停止"），匹配条件收窄到
+  `bin.js`/`@deepseek-ai\dsh`（不再误杀路径含 "dsh" 的无关 node 服务）；`start-dsh.ps1` 的
+  `npm root -g` 不再用 `2>$null`（PS 5.1 下重定向 stderr 会终止脚本，一键启动器静默失败）；
+  `build.ps1` 在找不到 `csc.exe` 时给出明确报错。
+- **start-dsh.ps1 对齐主程序**：`Find-NodeExe` 优先随包 `runtime\node`；`Find-DshBinJs` 增加
+  `npm root -g` 全局安装探测；改用单条命令行字符串传参（规避 PS5.1/7 引号差异），不再覆盖自动变量
+  `$args`；进程即退时快速失败并区分"启动失败/超时"，超时不再打开浏览器。
+- **启动后首页空白、需点击实例才显示**：此前启动时 5 个标签页全部 `Visible`（从未做过初始可见性设置），
+  叠放导致首页/诊断页显示异常；且启动后没有任何显式刷新，信息要等 ~2s 轮询或手动点击才出现。
+  现改为：启动只显示激活页（overview），并显示后立即 `UpdateSelectedUi()+RefreshSettings()` 刷新
+  当前实例信息，无需等待或点击。
+- **DSH_HOME 提示误导**：DSH_HOME 并非持久化环境变量（注册表无值），桌面快捷方式启动的管理器进程
+  确实不继承它，提示"未显式设置"是如实反映。已把提示文案补充"可在系统环境变量中设置，重启管理器后
+  生效"，避免用户误以为配置丢失。
+- **初始状态显示"未知"**：`SvcState.Unknown` 是实例默认初始值，启动后要等首次 2s 轮询才更新，期间
+  显示"未知"。现改为启动后立即触发一次探测（`PollStates()`），并把"未知"文案改为"检测中…"。
+- **未启动服务时永远卡在"检测中…"**（上次"启动即探测"未解决的真正原因）：
+  向**未监听**的端口发 HTTP 探测要等 TCP 连接失败，本机实测单次 2.05s（`Probe` 超时 2.5s 没到就失败），
+  比 2s 轮询间隔还长；而 `PollStates` 的"只回写最新一次探测结果"序号守卫拿结果与**最新发出的**序号比较，
+  于是每次探测回来时都已有更新的一次探测发出，结果**全部**被判过期丢弃，状态永远停在"检测中…"。
+  服务运行时探测仅需 ~0ms，所以该问题只在"未启动服务"时暴露。修复：
+  - **探测先查 TCP 监听表**（本地 API，~0ms）：绑定地址为 IPv4 字面量（默认 127.0.0.1）时，
+    端口上没有监听者即直接判定"已停止"，不再做慢速 HTTP 探测；主机名/IPv6 绑定仍走 HTTP 探测，避免漏判。
+  - **序号守卫改为只丢弃"比已回写结果更旧"的乱序结果**，不再与最新发出的序号比较，慢探测也能正常回写；
+    新增在途探测标记（同一实例不叠加探测），启停/重启/安装前作废在途探测，避免旧结果盖掉新状态。
+  - 实测（修复后，默认 127.0.0.1 配置）：未启动 → `Stopped` 0~13ms；运行中 → `Running` 0~36ms。
+- **概览页环境信息显示不全**：环境卡 Sub 区仅 2 行，原拼接的 DSH_HOME 状态+提示+node/dsh 版本超长
+  被裁切；且 node/dsh 版本要等后台 Resolve 完成才填充。现精简为两行（DSH_HOME 状态 / node·dsh 版本），
+  完整信息（含 DSH_WEB_URL 与设置指引）移至「关于」页运行环境区（Label 不限行数）。
+
 ## v1.2.5（2026-09-10）
 
 ### 修复

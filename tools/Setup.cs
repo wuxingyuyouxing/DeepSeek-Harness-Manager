@@ -21,8 +21,8 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("DeepSeek Harness Manager")]
 [assembly: AssemblyCompany("DeepSeek Harness")]
 [assembly: AssemblyCopyright("Copyright © 2026 DeepSeek Harness")]
-[assembly: AssemblyVersion("1.2.5.0")]
-[assembly: AssemblyFileVersion("1.2.5.0")]
+[assembly: AssemblyVersion("1.2.6.0")]
+[assembly: AssemblyFileVersion("1.2.6.0")]
 
 namespace SetupApp
 {
@@ -98,12 +98,40 @@ namespace SetupApp
                 DeleteFile(Path.Combine(startMenu, AppName + ".lnk"));
                 DeleteFile(Path.Combine(startMenu, "卸载.lnk"));
                 try { if (Directory.Exists(startMenu)) Directory.Delete(startMenu, true); } catch { }
-                // 删除安装目录
-                if (dir.Length > 0) { try { Directory.Delete(dir, true); } catch { } }
+                // 删除安装目录：先校验确实是本程序安装目录（含主程序、非盘符根/系统目录），
+                // 防止注册表 InstallLocation 被改写后误删系统目录；删除失败（如 dsh 服务占用文件）要如实反馈
+                if (dir.Length > 0)
+                {
+                    bool valid = Directory.Exists(dir)
+                        && File.Exists(Path.Combine(dir, AppExe))
+                        && !IsDriveRoot(dir);
+                    if (valid)
+                    {
+                        try { Directory.Delete(dir, true); }
+                        catch (Exception ex)
+                        {
+                            MessageBox.Show("安装目录删除失败：" + ex.Message + "\n请先停止正在运行的 dsh 服务（或管理器），然后重试卸载。",
+                                "卸载", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return; // 保留注册表入口，便于重试
+                        }
+                    }
+                }
                 // 删除注册表
                 try { Registry.CurrentUser.DeleteSubKeyTree(RegKey, false); } catch { }
             }
             catch { }
+        }
+
+        // 判断路径是否为盘符根（C:\ 等），卸载防护用
+        static bool IsDriveRoot(string dir)
+        {
+            try
+            {
+                string r = Path.GetPathRoot(dir ?? "");
+                if (string.IsNullOrEmpty(r)) return false;
+                return string.Equals(r.TrimEnd('\\', '/'), dir.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
         }
 
         static void DeleteFile(string p) { try { if (File.Exists(p)) File.Delete(p); } catch { } }
@@ -115,6 +143,7 @@ namespace SetupApp
             ProgressBar bar;
             Label lblStatus, lblHeader, lblSub;
             bool installing;
+            bool done;   // 安装是否已成功完成（完成后点击走 Finish）
             string installDir;
 
             public InstallForm()
@@ -192,7 +221,8 @@ namespace SetupApp
                 btnInstall.FlatAppearance.BorderSize = 0;
                 btnInstall.Location = new Point(288, 256);
                 btnInstall.Size = new Size(92, 30);
-                btnInstall.Click += delegate { BeginInstall(); };
+                // 单一 Click 处理器：安装完成后进入 Finish（不再用匿名委托 -= / += 切换，避免移除的是新实例）
+                btnInstall.Click += delegate { if (done) Finish(); else BeginInstall(); };
                 Controls.Add(btnInstall);
 
                 // 检测到已有安装时提示"升级"，并明确保留配置/日志
@@ -248,8 +278,7 @@ namespace SetupApp
                 lblStatus.Text = "安装完成！";
                 btnInstall.Text = "完成";
                 btnInstall.Enabled = true;
-                btnInstall.Click -= delegate { BeginInstall(); };
-                btnInstall.Click += delegate { Finish(); };
+                done = true; // 后续点击走 Finish()
             }
 
             // 供静默安装调用
@@ -274,6 +303,11 @@ namespace SetupApp
                         {
                             string target = Path.Combine(installDir, e.FullName.Replace('/', Path.DirectorySeparatorChar));
                             if (e.FullName.EndsWith("/") || e.FullName.EndsWith("\\")) continue;
+                            // zip-slip 防护：目标必须位于安装目录之下（拒绝 .. 段/绝对路径/UNC 条目），
+                            // payload 虽为构建时自嵌，仍按不信任输入处理
+                            string fullInstall = Path.GetFullPath(installDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                            if (!Path.GetFullPath(target).StartsWith(fullInstall, StringComparison.OrdinalIgnoreCase))
+                                throw new Exception("安装包包含非法路径条目：" + e.FullName);
                             string d = Path.GetDirectoryName(target);
                             if (!string.IsNullOrEmpty(d) && !Directory.Exists(d)) Directory.CreateDirectory(d);
                             using (Stream es = e.Open())
@@ -317,7 +351,7 @@ namespace SetupApp
                     k.SetValue("DisplayIcon", exePath);
                     k.SetValue("InstallLocation", installDir);
                     k.SetValue("UninstallString", "\"" + Assembly.GetExecutingAssembly().Location + "\" --uninstall");
-                    k.SetValue("DisplayVersion", "1.2.1");
+                    k.SetValue("DisplayVersion", Assembly.GetExecutingAssembly().GetName().Version.ToString(3));
                     k.SetValue("Publisher", "DeepSeek Harness");
                 }
             }
