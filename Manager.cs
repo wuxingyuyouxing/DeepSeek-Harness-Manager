@@ -29,8 +29,8 @@ using Timer = System.Windows.Forms.Timer;
 [assembly: AssemblyProduct("DeepSeek Harness Manager")]
 [assembly: AssemblyCompany("DeepSeek Harness")]
 [assembly: AssemblyCopyright("Copyright © 2026 DeepSeek Harness")]
-[assembly: AssemblyVersion("1.2.6.0")]
-[assembly: AssemblyFileVersion("1.2.6.0")]
+[assembly: AssemblyVersion("1.2.7.0")]
+[assembly: AssemblyFileVersion("1.2.7.0")]
 
 namespace DshManager
 {
@@ -327,6 +327,33 @@ namespace DshManager
         [DllImport("uxtheme.dll", EntryPoint = "#133")]
         public static extern bool AllowDarkModeForWindow(IntPtr hwnd, bool allow);
 
+        [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+        public static extern int SetWindowTheme(IntPtr hwnd, string subAppName, string subIdList);
+
+        // 让某个窗口（含对话框）在深色主题下也用深色标题栏/边框。
+        // 主窗体有 ApplyChrome 处理，但对话框（编辑实例/三选一删除/消息框…）不会自动跟随——
+        // 实测深色下对话框标题栏仍是 255,255,255 的白条，而主窗口是 43,43,43。
+        public static void ApplyDarkTitleBar(IntPtr hwnd, bool dark)
+        {
+            try
+            {
+                int v = dark ? 1 : 0;
+                DwmSetAttribute(hwnd, 19, v);
+                DwmSetAttribute(hwnd, 20, v);
+                AllowDarkModeForWindow(hwnd, dark);
+                RefreshFrame(hwnd);
+            }
+            catch { }
+        }
+
+        // 让标准控件的"非客户区"部件（滚动条等）跟随深色：RichTextBox 的滚动条默认是系统浅色。
+        // DarkMode_Explorer 是 Win10 1809+ 的非公开主题名，失败时无副作用。
+        public static void ApplyDarkScrollbars(IntPtr hwnd, bool dark)
+        {
+            try { SetWindowTheme(hwnd, dark ? "DarkMode_Explorer" : "Explorer", null); }
+            catch { }
+        }
+
 
         [DllImport("iphlpapi.dll", SetLastError = true)]
         static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int pdwSize, bool bOrder, int ulAf, int TableClass, int Reserved);
@@ -366,6 +393,44 @@ namespace DshManager
                 finally { Marshal.FreeHGlobal(buf); }
             }
             return -1; // 重试后仍拿不到稳定的表
+        }
+
+        // 返回 pid → 该进程正在监听的端口列表（IPv4 TCP 表）。
+        // 用途：扫描本机正在运行的 DSH 服务时，判断某个 node 进程是不是"对外提供服务的那个"
+        // （dsh 会派生子进程 runner.js，它不监听任何端口，靠这一点可以把它排除掉）。
+        public static Dictionary<int, List<int>> GetListeningPortsByPid()
+        {
+            Dictionary<int, List<int>> map = new Dictionary<int, List<int>>();
+            const int AF_INET = 2, TCP_TABLE_OWNER_PID_ALL = 5, ERROR_INSUFFICIENT_BUFFER = 122;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                int size = 0;
+                GetExtendedTcpTable(IntPtr.Zero, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+                if (size <= 0) break;
+                IntPtr buf = Marshal.AllocHGlobal(size);
+                try
+                {
+                    uint rc = GetExtendedTcpTable(buf, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+                    if (rc == ERROR_INSUFFICIENT_BUFFER) continue; // 表变大了，重试
+                    if (rc != 0) break;
+                    int num = Marshal.ReadInt32(buf);
+                    int stride = Marshal.SizeOf(typeof(MibTcpRowOwnerPid));
+                    for (int i = 0; i < num; i++)
+                    {
+                        IntPtr row = new IntPtr(buf.ToInt64() + 4 + (long)i * stride);
+                        MibTcpRowOwnerPid r = (MibTcpRowOwnerPid)Marshal.PtrToStructure(row, typeof(MibTcpRowOwnerPid));
+                        if (r.state != 2) continue; // 2 = LISTEN
+                        int p = (ushort)((r.localPort >> 8) | ((r.localPort & 0xFF) << 8));
+                        int pid = (int)r.owningPid;
+                        List<int> ports;
+                        if (!map.TryGetValue(pid, out ports)) { ports = new List<int>(); map[pid] = ports; }
+                        if (!ports.Contains(p)) ports.Add(p);
+                    }
+                }
+                finally { Marshal.FreeHGlobal(buf); }
+                break;
+            }
+            return map;
         }
     }
 
@@ -1111,6 +1176,24 @@ namespace DshManager
             }
         }
 
+        // 结束整棵进程树（dsh 会派生子进程，只杀父进程会留下孤儿继续占用端口）。
+        // 停服与"停止未纳管的 DSH 服务"共用这一条路径。
+        public static bool KillProcessTree(int pid)
+        {
+            if (pid <= 0) return false;
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = "taskkill.exe";
+                psi.Arguments = "/PID " + pid + " /T /F";
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                using (Process tp = Process.Start(psi)) { tp.WaitForExit(5000); }
+                return true;
+            }
+            catch { return false; }
+        }
+
         public static void Stop(InstanceRuntime rt, bool manual)
         {
             // 先取本地引用并摘掉 rt.Proc：在途探测（Detect）可能同时检查/Dispose 并置空 rt.Proc，
@@ -1129,19 +1212,7 @@ namespace DshManager
                     int byPort = Native.GetPidByPort(rt.Cfg.Port);
                     if (byPort > 0) pid = byPort; // -1 = 查询失败，不做处理
                 }
-                if (pid != 0)
-                {
-                    try
-                    {
-                        ProcessStartInfo psi = new ProcessStartInfo();
-                        psi.FileName = "taskkill.exe";
-                        psi.Arguments = "/PID " + pid + " /T /F";
-                        psi.UseShellExecute = false;
-                        psi.CreateNoWindow = true;
-                        using (Process tp = Process.Start(psi)) { tp.WaitForExit(5000); }
-                    }
-                    catch { }
-                }
+                if (pid != 0) KillProcessTree(pid);
                 if (proc != null)
                 {
                     try { proc.CancelOutputRead(); proc.CancelErrorRead(); } catch { }
@@ -1157,6 +1228,76 @@ namespace DshManager
                 rt.Pid = 0;
             }
             catch { }
+        }
+
+        // ── 扫描本机正在运行的 DSH 服务 ──
+        // 背景：管理器只认 config.json 里的实例，删掉实例（或从别的启动器/命令行起的服务）
+        // 就成了"看不见的服务"——进程还在跑、端口还占着，但界面上无处可查。
+        // 判据（两级，缺一不可）：
+        //   1) 命令行是 dsh 的 CLI 入口（.../@deepseek-ai/dsh/lib/bin.js，排除 dsh 自己派生的
+        //      node_modules\...\runner.js 子进程——实测它会作为另一个 node.exe 出现）；
+        //   2) 该进程确实在监听 TCP 端口（runner.js 不监听）。
+        public class LocalDshService
+        {
+            public int Pid;
+            public int Port;        // 0 = 未识别到监听端口
+            public long MemMb;
+            public DateTime StartedAt;
+            public string CmdLine = "";
+        }
+
+        public static List<LocalDshService> ScanLocalServices()
+        {
+            List<LocalDshService> res = new List<LocalDshService>();
+            try
+            {
+                Dictionary<int, List<int>> listeners = Native.GetListeningPortsByPid();
+                using (System.Management.ManagementObjectSearcher searcher = new System.Management.ManagementObjectSearcher(
+                    "SELECT ProcessId, CommandLine, WorkingSetSize, CreationDate FROM Win32_Process WHERE Name='node.exe'"))
+                {
+                    foreach (System.Management.ManagementBaseObject mo in searcher.Get())
+                    {
+                        try
+                        {
+                            int pid = Convert.ToInt32(mo["ProcessId"]);
+                            string cmd = (mo["CommandLine"] as string) ?? "";
+                            if (cmd.Length == 0) continue;
+
+                            string node, entry;
+                            ParseLaunchCommand(cmd, out node, out entry);
+                            if (entry.Length == 0) continue;
+                            string e = entry.ToLowerInvariant();
+                            // 只认 dsh CLI 入口（bin.js）；runner.js 之类的内部子进程在此被排除
+                            if (!e.EndsWith("bin.js") || e.IndexOf("dsh", StringComparison.Ordinal) < 0) continue;
+
+                            List<int> ports;
+                            bool hasPort = listeners.TryGetValue(pid, out ports) && ports != null && ports.Count > 0;
+                            if (!hasPort) continue; // 不监听端口 = 不是对外服务
+
+                            // 端口优先取启动命令里的 --port（更权威），否则用监听表中的端口
+                            int port = ports[0];
+                            Match pm = Regex.Match(cmd, @"--port\s+(\d{1,5})");
+                            if (pm.Success)
+                            {
+                                int p2;
+                                if (int.TryParse(pm.Groups[1].Value, out p2) && p2 > 0) port = p2;
+                            }
+
+                            LocalDshService s = new LocalDshService();
+                            s.Pid = pid;
+                            s.Port = port;
+                            s.CmdLine = cmd;
+                            try { s.MemMb = Convert.ToInt64(mo["WorkingSetSize"]) / (1024 * 1024); } catch { }
+                            try { s.StartedAt = System.Management.ManagementDateTimeConverter.ToDateTime(mo["CreationDate"] as string); } catch { }
+                            res.Add(s);
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+            res.Sort(delegate(LocalDshService a, LocalDshService b) { return a.Port.CompareTo(b.Port); });
+            return res;
         }
     }
 
@@ -1977,11 +2118,15 @@ namespace DshManager
     }
 
     // ───────────────────────────────────────────────────────────── 实例编辑对话框（标准对话框）
-    class InstanceEditorDialog : Form
+    class InstanceEditorDialog : ThemedForm
     {
         TextBox tbName, tbHost, tbPort;
         SwitchControl swOpen, swWatch;
         public InstanceConfig Result;
+        // 由调用方（MainForm）注入的额外校验：返回非空字符串表示不通过，对话框保持打开并提示，
+        // 这样用户已填的内容不会丢（用于"同地址+端口只能有一个实例"这类跨实例校验）
+        // 命名避开 Control/ContainerControl 自带的 Validate() 方法（同名会产生 CS0108 隐藏警告）
+        public Func<InstanceConfig, string> Validator;
 
         public InstanceEditorDialog(InstanceConfig edit)
         {
@@ -1990,61 +2135,98 @@ namespace DshManager
             MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size((int)Ui.P(380), (int)Ui.P(300));
+            ClientSize = new Size((int)Ui.P(400), (int)Ui.P(322));
             BackColor = Theme.Current.Page;
             ShowInTaskbar = false;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
             Panel body = new Panel();
             body.Dock = DockStyle.Fill;
-            body.Padding = new Padding((int)Ui.P(20));
             Controls.Add(body);
 
-            int y = Ui.P(10);
-            body.Controls.Add(MkLabel("名称"));
+            // 显式坐标布局。注意：子控件是手工定位的，Panel.Padding 只影响停靠布局、不影响手写坐标；
+            // 之前三个标签都没设置 Location（Label 默认 AutoSize，Size 也不生效），全部叠在 (0,0)，
+            // 只有最先添加的"名称"可见——"绑定地址"/"端口"标签实际是隐形的，端口框还被放到了
+            // 地址框下方 22px 处，看起来就是"错位且没有提示"。
+            int padX = (int)Ui.P(20);
+            int fieldW = ClientSize.Width - padX * 2;
+            int lh = (int)Ui.P(18);   // 标签高
+            int boxH = (int)Ui.P(28); // 输入框高
+            int lbGap = (int)Ui.P(4); // 标签与其输入框的间距
+            int groupGap = (int)Ui.P(22); // 组与组的间距
+            int portW = (int)Ui.P(114);
+            int colGap = (int)Ui.P(14);
+
+            int y = (int)Ui.P(14);
+            Label lbName = MkLabel("名称");
+            lbName.Location = new Point(padX, y);
+            lbName.Size = new Size(fieldW, lh);
+            body.Controls.Add(lbName);
+
             tbName = MkTextBox(edit != null ? edit.Name : "新实例");
-            tbName.Location = new Point(Ui.P(20), y += Ui.P(22));
-            tbName.Size = new Size(ClientSize.Width - Ui.P(40), Ui.P(28));
+            tbName.Location = new Point(padX, y + lh + lbGap);
+            tbName.Size = new Size(fieldW, boxH);
             body.Controls.Add(tbName);
 
-            body.Controls.Add(MkLabel("绑定地址"));
+            // 地址与端口同一行：各自的标签位于各自输入框正上方，输入框底边对齐
+            int rowY = tbName.Bottom + groupGap;
+            Label lbHost = MkLabel("绑定地址");
+            lbHost.Location = new Point(padX, rowY);
+            lbHost.Size = new Size(fieldW - portW - colGap, lh);
+            body.Controls.Add(lbHost);
+
+            Label lbPort = MkLabel("端口");
+            lbPort.Location = new Point(padX + fieldW - portW, rowY);
+            lbPort.Size = new Size(portW, lh);
+            body.Controls.Add(lbPort);
+
             tbHost = MkTextBox(edit != null ? edit.Host : "127.0.0.1");
-            tbHost.Location = new Point(Ui.P(20), y += Ui.P(46));
-            tbHost.Size = new Size((int)((ClientSize.Width - Ui.P(40)) * 0.55), Ui.P(28));
+            tbHost.Location = new Point(padX, rowY + lh + lbGap);
+            tbHost.Size = new Size(fieldW - portW - colGap, boxH);
             body.Controls.Add(tbHost);
 
-            body.Controls.Add(MkLabel("端口"));
             tbPort = MkTextBox(edit != null ? edit.Port.ToString() : "3080");
-            tbPort.Location = new Point((int)(Ui.P(20) + (ClientSize.Width - Ui.P(40)) * 0.6), y += Ui.P(22));
-            tbPort.Size = new Size((int)((ClientSize.Width - Ui.P(40)) * 0.38), Ui.P(28));
+            tbPort.Location = new Point(padX + fieldW - portW, rowY + lh + lbGap);
+            tbPort.Size = new Size(portW, boxH);
             body.Controls.Add(tbPort);
 
-            y += Ui.P(40);
+            // 明确写出可用范围，避免填了主机名/IPv6 后被 dsh 拒绝启动却不知道原因
+            Label lbHint = MkLabel("仅支持 127.0.0.1（DSH 当前版本不支持局域网绑定）");
+            lbHint.Font = new Font("Segoe UI", 8f, FontStyle.Regular);
+            lbHint.Location = new Point(padX, tbHost.Bottom + (int)Ui.P(8));
+            lbHint.Size = new Size(fieldW, (int)Ui.P(16));
+            body.Controls.Add(lbHint);
+
+            int swY = lbHint.Bottom + (int)Ui.P(18);
             swOpen = new SwitchControl();
             swOpen.Label = "启动成功后自动打开浏览器";
-            swOpen.Location = new Point(Ui.P(16), y);
-            swOpen.Size = new Size(ClientSize.Width - Ui.P(32), Ui.P(30));
+            swOpen.Location = new Point((int)Ui.P(14), swY);
+            swOpen.Size = new Size(ClientSize.Width - (int)Ui.P(28), (int)Ui.P(30));
             swOpen.Checked = edit == null || edit.AutoOpenBrowser;
             body.Controls.Add(swOpen);
 
             swWatch = new SwitchControl();
             swWatch.Label = "看门狗：意外退出自动重启";
-            swWatch.Location = new Point(Ui.P(16), y += Ui.P(36));
-            swWatch.Size = new Size(ClientSize.Width - Ui.P(32), Ui.P(30));
+            swWatch.Location = new Point((int)Ui.P(14), swY + (int)Ui.P(38));
+            swWatch.Size = new Size(ClientSize.Width - (int)Ui.P(28), (int)Ui.P(30));
             swWatch.Checked = edit != null && edit.Watchdog;
             body.Controls.Add(swWatch);
 
+            // 按钮贴在对话框右下角（之前用 ClientSize.Height - 56 定位，而按钮是加在有 Padding 的
+            // Panel 里、坐标以 Panel 客户区为原点，底部会被裁掉一截）
+            int btnW = (int)Ui.P(72), btnH = (int)Ui.P(32), btnGap = (int)Ui.P(10);
+            int btnY = ClientSize.Height - (int)Ui.P(20) - btnH;
             PillButton ok = new PillButton();
             ok.Kind = PillButton.Variant.Primary;
             ok.Label = "保存";
-            ok.Location = new Point(ClientSize.Width - Ui.P(150), ClientSize.Height - Ui.P(56));
-            ok.Size = new Size(Ui.P(64), Ui.P(32));
+            ok.Location = new Point(ClientSize.Width - (int)Ui.P(20) - btnW - btnGap - btnW, btnY);
+            ok.Size = new Size(btnW, btnH);
             ok.Click += delegate
             {
                 int port;
                 if (!int.TryParse(tbPort.Text.Trim(), out port) || port < 1 || port > 65535)
                 {
-                    MessageBox.Show(this, "端口必须是 1-65535 的数字。", "输入有误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    MsgBox.Show(this, "端口必须是 1-65535 的数字。", "输入有误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
                 if (tbName.Text.Trim().Length == 0) tbName.Text = "实例";
@@ -2055,7 +2237,7 @@ namespace DshManager
                 // 填主机名或 IPv6 会被 dsh 拒绝启动，因此提示里明确只推荐 127.0.0.1。
                 if (!Regex.IsMatch(host, @"^[A-Za-z0-9\.\-:\[\]]+$"))
                 {
-                    MessageBox.Show(this, "绑定地址只能包含字母、数字、点、横线、冒号。\n推荐使用 127.0.0.1（DSH 当前版本仅支持 127.0.0.1 / 0.0.0.0）。",
+                    MsgBox.Show(this, "绑定地址只能包含字母、数字、点、横线、冒号。\n推荐使用 127.0.0.1（DSH 当前版本仅支持 127.0.0.1 / 0.0.0.0）。",
                         "输入有误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
@@ -2066,6 +2248,15 @@ namespace DshManager
                 Result.AutoOpenBrowser = swOpen.Checked;
                 Result.Watchdog = swWatch.Checked;
                 Result.ManualStopped = edit != null && edit.ManualStopped;
+                if (Validator != null)
+                {
+                    string err = Validator(Result);
+                    if (!string.IsNullOrEmpty(err))
+                    {
+                        MsgBox.Show(this, err, "输入有误", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return; // 保持对话框打开，已填内容不丢
+                    }
+                }
                 DialogResult = DialogResult.OK;
                 Close();
             };
@@ -2074,8 +2265,8 @@ namespace DshManager
             PillButton cancel = new PillButton();
             cancel.Kind = PillButton.Variant.Ghost;
             cancel.Label = "取消";
-            cancel.Location = new Point(ClientSize.Width - Ui.P(80), ClientSize.Height - Ui.P(56));
-            cancel.Size = new Size(Ui.P(64), Ui.P(32));
+            cancel.Location = new Point(ClientSize.Width - (int)Ui.P(20) - btnW, btnY);
+            cancel.Size = new Size(btnW, btnH);
             cancel.Click += delegate { DialogResult = DialogResult.Cancel; Close(); };
             body.Controls.Add(cancel);
         }
@@ -2084,6 +2275,8 @@ namespace DshManager
         {
             Label l = new Label();
             l.Text = s;
+            l.AutoSize = false;              // 默认 AutoSize=true 会让设置的 Size 失效，布局不可控
+            l.TextAlign = ContentAlignment.MiddleLeft;
             l.BackColor = Color.Transparent; // Label 默认灰底，必须透明（深色主题下尤其明显）
             l.Font = new Font("Segoe UI", 9f, FontStyle.Regular);
             l.ForeColor = Theme.Current.TextMuted;
@@ -2102,12 +2295,349 @@ namespace DshManager
         }
     }
 
+    // ───────────────────────────────────────────────────────────── 删除实例：服务在跑时三选一
+    enum InstanceDeleteChoice { Cancel, DeleteOnly, StopAndDelete }
+
+    // 标准 MessageBox 只有 是/否/取消 且不能改按钮文字，这里用主题风格的小对话框给出三个明确选项
+    class InstanceDeleteDialog : ThemedForm
+    {
+        InstanceDeleteChoice Choice = InstanceDeleteChoice.Cancel;
+
+        public static InstanceDeleteChoice Ask(IWin32Window owner, string message, string instanceName)
+        {
+            using (InstanceDeleteDialog d = new InstanceDeleteDialog(message, instanceName))
+            {
+                d.ShowDialog(owner);
+                return d.Choice;
+            }
+        }
+
+        InstanceDeleteDialog(string message, string instanceName)
+        {
+            Text = "删除实例";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size((int)Ui.P(500), (int)Ui.P(226));
+            BackColor = Theme.Current.Page;
+            ShowInTaskbar = false;
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+
+            Label body = new Label();
+            body.Text = message;
+            body.AutoSize = false;
+            body.BackColor = Color.Transparent;
+            body.ForeColor = Theme.Current.Text;
+            body.Font = new Font("Segoe UI", 9f);
+            body.Location = new Point((int)Ui.P(20), (int)Ui.P(18));
+            body.Size = new Size(ClientSize.Width - (int)Ui.P(40), (int)Ui.P(150));
+            Controls.Add(body);
+
+            int btnW = (int)Ui.P(120), btnH = (int)Ui.P(32), gap = (int)Ui.P(10);
+            int y = ClientSize.Height - (int)Ui.P(20) - btnH;
+
+            PillButton cancel = new PillButton();
+            cancel.Kind = PillButton.Variant.Ghost;
+            cancel.Label = "取消";
+            cancel.Size = new Size((int)Ui.P(72), btnH);
+            cancel.Location = new Point(ClientSize.Width - (int)Ui.P(20) - cancel.Width, y);
+            cancel.Click += delegate { Choice = InstanceDeleteChoice.Cancel; Close(); };
+            Controls.Add(cancel);
+
+            PillButton only = new PillButton();
+            only.Kind = PillButton.Variant.Ghost;
+            only.Label = "仅删除";
+            only.Size = new Size(btnW, btnH);
+            only.Location = new Point(cancel.Left - gap - btnW, y);
+            only.Click += delegate { Choice = InstanceDeleteChoice.DeleteOnly; Close(); };
+            Controls.Add(only);
+
+            PillButton stop = new PillButton();
+            stop.Kind = PillButton.Variant.Primary;
+            stop.Label = "停止并删除";
+            stop.Size = new Size(btnW, btnH);
+            stop.Location = new Point(only.Left - gap - btnW, y);
+            stop.Click += delegate { Choice = InstanceDeleteChoice.StopAndDelete; Close(); };
+            Controls.Add(stop);
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────── 主题化对话框基类
+    // 深色主题下对话框（编辑实例、三选一删除、消息框…）默认只有客户区变深，标题栏仍是系统白条。
+    // 统一在这里处理：主题底色 + 深色标题栏；新建对话框只需继承本类。
+    class ThemedForm : Form
+    {
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            BackColor = Theme.Current.Page;
+            Native.ApplyDarkTitleBar(Handle, Theme.Current.IsDark);
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────── 主题化下拉菜单渲染器
+    // WinForms 的 ContextMenuStrip 默认走系统主题：深色界面下弹出一个白底菜单（实测背景 253,253,253）。
+    // 全部颜色在绘制时读取 Theme.Current，所以切换主题后无需重建菜单。
+    class ThemedMenuRenderer : ToolStripProfessionalRenderer
+    {
+        public ThemedMenuRenderer() : base(new ProfessionalColorTable()) { RoundedEdges = false; }
+
+        static Color MenuBack() { Theme T = Theme.Current; return T.IsDark ? Color.FromArgb(37, 40, 50) : Color.White; }
+        static Color MenuHover() { Theme T = Theme.Current; return T.IsDark ? Color.FromArgb(52, 58, 74) : Color.FromArgb(238, 241, 247); }
+        static Color MenuBorder() { Theme T = Theme.Current; return T.IsDark ? Color.FromArgb(70, 78, 96) : Color.FromArgb(214, 219, 228); }
+
+        protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
+        {
+            using (SolidBrush b = new SolidBrush(MenuBack())) e.Graphics.FillRectangle(b, e.AffectedBounds);
+        }
+
+        // 左侧图标栏：默认会填一块浅色，必须与菜单底色一致
+        protected override void OnRenderImageMargin(ToolStripRenderEventArgs e)
+        {
+            using (SolidBrush b = new SolidBrush(MenuBack())) e.Graphics.FillRectangle(b, e.AffectedBounds);
+        }
+
+        protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
+        {
+            using (Pen p = new Pen(MenuBorder()))
+            {
+                Rectangle r = new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
+                e.Graphics.DrawRectangle(p, r);
+            }
+        }
+
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            bool hot = e.Item.Selected || e.Item.Pressed;
+            using (SolidBrush b = new SolidBrush(hot ? MenuHover() : MenuBack()))
+                e.Graphics.FillRectangle(b, new Rectangle(Point.Empty, e.Item.Size));
+        }
+
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            Theme T = Theme.Current;
+            e.TextColor = e.Item.Enabled ? T.Text : T.TextFaint;
+            // 必须回调基类：真正画文字的是基类实现（只设颜色不调用 base 会出现"菜单空白无字"）
+            base.OnRenderItemText(e);
+        }
+
+        protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+        {
+            using (Pen p = new Pen(MenuBorder()))
+            {
+                int y = e.Item.Height / 2;
+                e.Graphics.DrawLine(p, 8, y, e.Item.Width - 8, y);
+            }
+        }
+    }
+
+    // 菜单渲染器共用一个实例（ToolStripRenderer 无状态，可被多个菜单复用）
+    static class MenuTheme
+    {
+        public static readonly ThemedMenuRenderer Renderer = new ThemedMenuRenderer();
+    }
+
+    // ───────────────────────────────────────────────────────────── 主题化消息框
+    // 系统 MessageBox 无法换肤：深色主题下会弹出系统浅色对话框（实测背景 255,255,255），
+    // 与深色界面格格不入。这里用与主界面同一套主题色的自绘对话框替代，
+    // 调用形态与 MessageBox.Show 保持一致（本项目只用到了 owner/text/caption/buttons/icon 这一种）。
+    static class MsgBox
+    {
+        public static DialogResult Show(string text)
+        {
+            return Show(null, text, "", MessageBoxButtons.OK, MessageBoxIcon.None);
+        }
+        public static DialogResult Show(IWin32Window owner, string text)
+        {
+            return Show(owner, text, "", MessageBoxButtons.OK, MessageBoxIcon.None);
+        }
+        public static DialogResult Show(IWin32Window owner, string text, string caption)
+        {
+            return Show(owner, text, caption, MessageBoxButtons.OK, MessageBoxIcon.None);
+        }
+        public static DialogResult Show(IWin32Window owner, string text, string caption, MessageBoxButtons buttons)
+        {
+            return Show(owner, text, caption, buttons, MessageBoxIcon.None);
+        }
+        public static DialogResult Show(IWin32Window owner, string text, string caption, MessageBoxButtons buttons, MessageBoxIcon icon)
+        {
+            try
+            {
+                using (ThemedMsgDialog d = new ThemedMsgDialog(text, caption, buttons, icon))
+                {
+                    if (owner != null) return d.ShowDialog(owner);
+                    Form f = Form.ActiveForm;
+                    return f != null ? d.ShowDialog(f) : d.ShowDialog();
+                }
+            }
+            catch
+            {
+                // 极端情况（句柄创建失败等）退化为系统消息框，保证功能不丢
+                return System.Windows.Forms.MessageBox.Show(owner, text, caption, buttons, icon);
+            }
+        }
+    }
+
+    class ThemedMsgDialog : ThemedForm
+    {
+
+        public ThemedMsgDialog(string text, string caption, MessageBoxButtons buttons, MessageBoxIcon icon)
+        {
+            Text = string.IsNullOrEmpty(caption) ? "DeepSeek Harness" : caption;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            ShowInTaskbar = false;
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+
+            Theme T = Theme.Current;
+            Font textFont = new Font("Segoe UI", 9.5f);
+            int pad = (int)Ui.P(20);
+            int iconW = (int)Ui.P(34);
+            int maxTextW = (int)Ui.P(440);
+
+            Size measured = TextRenderer.MeasureText(text, textFont,
+                new Size(maxTextW, int.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+            int textW = Math.Min(maxTextW, Math.Max(measured.Width, (int)Ui.P(160)));
+            int textH = measured.Height;
+
+            int btnH = (int)Ui.P(32), btnGap = (int)Ui.P(10);
+            int bodyH = Math.Max(textH, (int)Ui.P(34));
+            int clientW = pad * 2 + iconW + (int)Ui.P(10) + textW;
+            int minW = (int)Ui.P(300);
+            if (clientW < minW) clientW = minW;
+            int clientH = pad + bodyH + (int)Ui.P(22) + btnH + (int)Ui.P(18);
+            ClientSize = new Size(clientW, clientH);
+            BackColor = T.Page;
+
+            // 图标（Segoe MDL2 字形，颜色随语义）
+            string glyph = "";
+            Color glyphColor = T.Accent;
+            switch (icon)
+            {
+                case MessageBoxIcon.Information: glyph = "\uE946"; glyphColor = T.Accent; break;
+                case MessageBoxIcon.Warning: glyph = "\uE7BA"; glyphColor = T.Warn; break;
+                case MessageBoxIcon.Error: glyph = "\uEA39"; glyphColor = T.Err; break;
+                case MessageBoxIcon.Question: glyph = "\uE897"; glyphColor = T.Accent; break;
+            }
+            if (glyph.Length > 0)
+            {
+                Label ic = new Label();
+                ic.Text = glyph;
+                ic.AutoSize = false;
+                ic.TextAlign = ContentAlignment.TopCenter;
+                ic.BackColor = Color.Transparent;
+                ic.ForeColor = glyphColor;
+                ic.Font = new Font("Segoe MDL2 Assets", 17f);
+                ic.Location = new Point(pad, pad);
+                ic.Size = new Size(iconW, (int)Ui.P(34));
+                Controls.Add(ic);
+            }
+
+            Label body = new Label();
+            body.Text = text;
+            body.AutoSize = false;
+            body.BackColor = Color.Transparent;
+            body.ForeColor = T.Text;
+            body.Font = textFont;
+            body.TextAlign = ContentAlignment.TopLeft;
+            body.Location = new Point(pad + iconW + (int)Ui.P(10), pad);
+            body.Size = new Size(textW + (int)Ui.P(4), textH + (int)Ui.P(4));
+            Controls.Add(body);
+
+            // 按钮：第一个为默认（Primary），其余 Ghost；右侧对齐
+            string[] labels;
+            DialogResult[] results;
+            switch (buttons)
+            {
+                case MessageBoxButtons.YesNo:
+                    labels = new string[] { "是", "否" }; results = new DialogResult[] { DialogResult.Yes, DialogResult.No }; break;
+                case MessageBoxButtons.YesNoCancel:
+                    labels = new string[] { "是", "否", "取消" }; results = new DialogResult[] { DialogResult.Yes, DialogResult.No, DialogResult.Cancel }; break;
+                case MessageBoxButtons.OKCancel:
+                    labels = new string[] { "确定", "取消" }; results = new DialogResult[] { DialogResult.OK, DialogResult.Cancel }; break;
+                default:
+                    labels = new string[] { "确定" }; results = new DialogResult[] { DialogResult.OK }; break;
+            }
+            int bw = (int)Ui.P(84);
+            int x = clientW - pad - bw;
+            int by = clientH - (int)Ui.P(18) - btnH;
+            for (int i = 0; i < labels.Length; i++)
+            {
+                DialogResult r = results[i];
+                PillButton b = new PillButton();
+                b.Kind = i == 0 ? PillButton.Variant.Primary : PillButton.Variant.Ghost;
+                b.Label = labels[i];
+                b.Size = new Size(bw, btnH);
+                b.Location = new Point(x, by);
+                b.Click += delegate { DialogResult = r; Close(); };
+                Controls.Add(b);
+                x -= bw + btnGap;
+            }
+        }
+
+        // Esc 行为对齐系统消息框：OK→OK、OKCancel/YesNoCancel→Cancel、YesNo→No；Enter/空格 = 默认按钮
+        protected override bool ProcessDialogKey(Keys keyData)
+        {
+            if (keyData == Keys.Enter || keyData == Keys.Space)
+            {
+                foreach (Control c in Controls)
+                {
+                    PillButton pb = c as PillButton;
+                    if (pb != null && pb.Kind == PillButton.Variant.Primary)
+                    {
+                        DialogResult = DefaultResult();
+                        Close();
+                        return true;
+                    }
+                }
+                return true;
+            }
+            if (keyData == Keys.Escape)
+            {
+                DialogResult = EscResult();
+                Close();
+                return true;
+            }
+            return base.ProcessDialogKey(keyData);
+        }
+
+        // 默认按钮的返回值（第一个按钮）
+        DialogResult DefaultResult()
+        {
+            foreach (Control c in Controls)
+            {
+                PillButton pb = c as PillButton;
+                if (pb == null || pb.Kind != PillButton.Variant.Primary) continue;
+                if (pb.Label == "是") return DialogResult.Yes;
+                if (pb.Label == "否") return DialogResult.No;
+                if (pb.Label == "取消") return DialogResult.Cancel;
+                return DialogResult.OK;
+            }
+            return DialogResult.OK;
+        }
+
+        DialogResult EscResult()
+        {
+            foreach (Control c in Controls)
+            {
+                PillButton pb = c as PillButton;
+                if (pb == null) continue;
+                if (pb.Label == "取消") return DialogResult.Cancel;
+                if (pb.Label == "否") return DialogResult.No;
+            }
+            return DialogResult.OK;
+        }
+    }
+
     // ───────────────────────────────────────────────────────────── 主窗体
     class MainForm : Form
     {
         List<InstanceRuntime> runtimes = new List<InstanceRuntime>();
         InstanceRuntime selected;
-        Timer pollTimer, logTimer, watchTimer;
+        Timer pollTimer, logTimer, watchTimer, scanTimer;
         NotifyIcon tray;
         ContextMenuStrip trayMenu;
         bool reallyExit;
@@ -2139,6 +2669,9 @@ namespace DshManager
         SwitchControl swAutoOpen, swWatch, swAutostart, swCloseExits;
         SectionLabel lblTheme;
         RichTextBox diagBox;
+        BaseControl servicesBar;    // 诊断页：未纳管服务的动作条
+        SectionLabel lblSvcBar;     // 诊断页：动作条左侧汇总
+        SectionLabel lblSvcSummary; // 概览页：本机 DSH 服务汇总/告警（点击跳到诊断页）
         TextBox tbNodePath, tbDshPath;
 
         public MainForm(bool minimized)
@@ -2179,6 +2712,13 @@ namespace DshManager
             watchTimer.Tick += delegate { Watchdog(); };
             watchTimer.Start();
 
+            // 本机 DSH 服务扫描：每 30 秒一次（WMI + TCP 表，放后台线程，不阻塞 UI），
+            // 用于发现"未纳管"的服务（删掉实例但服务还在跑、别的启动器起的、命令行手起的）
+            scanTimer = new Timer();
+            scanTimer.Interval = 30000;
+            scanTimer.Tick += delegate { ScanServices(); };
+            scanTimer.Start();
+
             if (minimized) { Hide(); }
             else { Show(); }
 
@@ -2186,6 +2726,11 @@ namespace DshManager
             UpdateSelectedUi();
             RefreshSettings();
             PollStates(); // 立即探测一次：状态（运行/停止）在 ~100ms 内就绪，几乎不出现"检测中"
+
+            // 存量重复实例（早期版本允许创建）在窗口可见时提示清理；托盘启动（minimized）不打扰
+            if (!minimized) CheckDuplicateInstances();
+
+            ScanServices(); // 启动即扫描一次本机 DSH 服务（未纳管时概览页会给提示）
 
             AutoCheckUpdates(); // 启动后静默检查一次 dsh/管理器更新（异步，失败静默）
         }
@@ -2200,6 +2745,7 @@ namespace DshManager
             tray.Visible = true;
 
             trayMenu = new ContextMenuStrip();
+            trayMenu.Renderer = MenuTheme.Renderer; // 与实例右键菜单一致：深色主题下不出现白底菜单
             ToolStripMenuItem mShow = new ToolStripMenuItem("打开主界面");
             mShow.Click += delegate { ShowWindow(); };
             ToolStripMenuItem mStart = new ToolStripMenuItem("启动服务");
@@ -2229,8 +2775,8 @@ namespace DshManager
         {
             reallyExit = true;
             try { tray.Visible = false; } catch { }
-            try { pollTimer.Stop(); logTimer.Stop(); watchTimer.Stop(); } catch { }
-            try { pollTimer.Dispose(); logTimer.Dispose(); watchTimer.Dispose(); } catch { }
+            try { pollTimer.Stop(); logTimer.Stop(); watchTimer.Stop(); scanTimer.Stop(); } catch { }
+            try { pollTimer.Dispose(); logTimer.Dispose(); watchTimer.Dispose(); scanTimer.Dispose(); } catch { }
             try { tray.Dispose(); trayMenu.Dispose(); } catch { }
             Close();
         }
@@ -2433,14 +2979,31 @@ namespace DshManager
         void ShowInstanceMenu(InstanceRuntime rt, Control host, Point at)
         {
             ContextMenuStrip m = new ContextMenuStrip();
+            m.Renderer = MenuTheme.Renderer; // 深色主题下也保持深色菜单（默认是系统白底）
             ToolStripMenuItem edit = new ToolStripMenuItem("编辑实例");
-            edit.Click += delegate { EditInstance(rt); };
             ToolStripMenuItem del = new ToolStripMenuItem("删除实例");
-            del.Click += delegate { DeleteInstance(rt); };
+            // 动作与菜单释放都必须延后到"菜单的关闭流程彻底结束"之后（BeginInvoke 排到 UI 队列），原因：
+            // 1) 在菜单项的 Click 里同步弹模态框（编辑对话框/删除确认框）会与 ToolStrip 的
+            //    ModalMenuFilter 冲突，表现为"点了没反应"；
+            // 2) v1.2.6 曾在 Closed 里同步 Dispose：Closed 触发时菜单自身仍在处理这次点击，
+            //    释放后它继续走 SetVisibleCore → CreateHandle 会抛 ObjectDisposedException
+            //    （logs\crash-*.log 里连刷 23 条），菜单点击全部失效而进程不崩，极难察觉；
+            // 3) 关键坑：实测事件顺序是 **Closed 先于 Click**（Closed 在关闭流程开始时就触发），
+            //    所以"在 Click 里记录选中项、在 Closed 里执行"的写法会把动作丢掉——
+            //    必须在各自的处理器里直接 Defer，不能跨事件传递状态。
+            edit.Click += delegate { DeferMenuAction(delegate { EditInstance(rt); }); };
+            del.Click += delegate { DeferMenuAction(delegate { DeleteInstance(rt); }); };
             m.Items.Add(edit);
             m.Items.Add(del);
-            m.Closed += delegate { m.Dispose(); };
+            m.Closed += delegate { DeferMenuAction(delegate { try { m.Dispose(); } catch { } }); };
             m.Show(host, at);
+        }
+
+        // 把动作排到 UI 消息队列稍后执行：此时菜单的关闭流程（含这次点击的处理）已完全结束
+        void DeferMenuAction(Action act)
+        {
+            try { BeginInvoke(act); }
+            catch { } // 窗口正在销毁（BeginInvoke 失败）：交给 GC，不再冒险同步执行
         }
 
         void SelectInstance(InstanceRuntime rt)
@@ -2455,6 +3018,7 @@ namespace DshManager
             logPos.Clear();
             logFile.Clear();
             logCarry.Clear();
+            logEmptyHintShown = false;
         }
 
         void RefreshSidebar()
@@ -2474,11 +3038,96 @@ namespace DshManager
             return null;
         }
 
+        // ── 实例唯一性 ──
+        // 同一个 host:port 只能有一个实例：它对应的是同一个服务（同一个监听进程/状态/日志），
+        // 重复实例只会互相干扰（启动第二个必然 EADDRINUSE、看门狗可能重复拉起、"真身"分不清）。
+        // localhost 与 127.0.0.1 指向同一服务，比较时归一化。
+        static string NormalizeHost(string h)
+        {
+            h = (h ?? "").Trim().ToLowerInvariant();
+            if (h.Length == 0) h = "127.0.0.1";
+            if (h == "localhost") h = "127.0.0.1";
+            return h;
+        }
+
+        // 返回非空字符串 = 校验不通过的原因（editing 为被编辑的实例，允许保持自身不变）
+        string ValidateInstanceConfig(InstanceConfig cfg, InstanceRuntime editing)
+        {
+            foreach (InstanceRuntime rt in runtimes)
+            {
+                if (rt == editing) continue;
+                if (rt.Cfg.Port == cfg.Port && NormalizeHost(rt.Cfg.Host) == NormalizeHost(cfg.Host))
+                    return "已存在使用相同地址和端口的实例「" + rt.Cfg.Name + "」（" + rt.Cfg.Host + ":" + rt.Cfg.Port + "）。\n\n"
+                         + "同一个端口只对应一个服务，重复的实例会互相干扰（启动时端口冲突、状态与日志重复）。\n"
+                         + "请换一个端口，或直接编辑那个实例。";
+            }
+            return null;
+        }
+
+        // 实例名重名时自动加后缀（侧栏要能分辨），editing 为被编辑实例（自身不算重名）
+        string UniqueInstanceName(string name, InstanceRuntime editing)
+        {
+            string baseName = (name ?? "").Trim();
+            if (baseName.Length == 0) baseName = "实例";
+            string candidate = baseName;
+            for (int n = 2; n < 1000; n++)
+            {
+                bool taken = false;
+                foreach (InstanceRuntime rt in runtimes)
+                {
+                    if (rt == editing) continue;
+                    if (string.Equals(rt.Cfg.Name, candidate, StringComparison.OrdinalIgnoreCase)) { taken = true; break; }
+                }
+                if (!taken) return candidate;
+                candidate = baseName + " " + n;
+            }
+            return candidate;
+        }
+
+        // 启动时检查配置里的存量重复实例（v1.2.6 之前允许创建），征得同意后移除多余的
+        void CheckDuplicateInstances()
+        {
+            List<InstanceRuntime> dupes = new List<InstanceRuntime>();
+            List<string> seen = new List<string>();
+            foreach (InstanceRuntime rt in runtimes)
+            {
+                string key = NormalizeHost(rt.Cfg.Host) + ":" + rt.Cfg.Port;
+                if (seen.Contains(key)) dupes.Add(rt);
+                else seen.Add(key);
+            }
+            if (dupes.Count == 0) return;
+
+            string msg = "检测到 " + dupes.Count + " 个重复实例（相同地址+端口只对应同一个服务）：\n\n";
+            seen.Clear();
+            foreach (InstanceRuntime rt in runtimes)
+            {
+                string key = NormalizeHost(rt.Cfg.Host) + ":" + rt.Cfg.Port;
+                if (seen.Contains(key)) msg += "  将移除：" + rt.Cfg.Name + "（" + rt.Cfg.Host + ":" + rt.Cfg.Port + "）\n";
+                else { seen.Add(key); msg += "  将保留：" + rt.Cfg.Name + "（" + rt.Cfg.Host + ":" + rt.Cfg.Port + "）\n"; }
+            }
+            msg += "\n是否现在移除多余的重复项？\n（只删除管理器里的实例条目，不会停止正在运行的服务）";
+
+            if (MsgBox.Show(this, msg, "发现重复实例", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+
+            bool selectedRemoved = dupes.Contains(selected);
+            foreach (InstanceRuntime rt in dupes)
+            {
+                runtimes.Remove(rt);
+                Settings.Data.Instances.Remove(rt.Cfg);
+            }
+            Settings.Save();
+            if (selectedRemoved || selected == null) selected = runtimes[0];
+            RebuildSidebarControl();
+            SelectInstance(selected);
+        }
+
         void AddInstance()
         {
             InstanceEditorDialog d = new InstanceEditorDialog(null);
+            d.Validator = delegate(InstanceConfig c) { return ValidateInstanceConfig(c, null); };
             if (d.ShowDialog(this) == DialogResult.OK && d.Result != null)
             {
+                d.Result.Name = UniqueInstanceName(d.Result.Name, null); // 重名自动加后缀，避免侧栏出现多个同名项
                 InstanceRuntime rt = new InstanceRuntime();
                 rt.Cfg = d.Result;
                 runtimes.Add(rt);
@@ -2492,9 +3141,10 @@ namespace DshManager
         void EditInstance(InstanceRuntime rt)
         {
             InstanceEditorDialog d = new InstanceEditorDialog(rt.Cfg);
+            d.Validator = delegate(InstanceConfig c) { return ValidateInstanceConfig(c, rt); };
             if (d.ShowDialog(this) == DialogResult.OK && d.Result != null)
             {
-                rt.Cfg.Name = d.Result.Name;
+                rt.Cfg.Name = UniqueInstanceName(d.Result.Name, rt);
                 rt.Cfg.Host = d.Result.Host;
                 rt.Cfg.Port = d.Result.Port;
                 rt.Cfg.AutoOpenBrowser = d.Result.AutoOpenBrowser;
@@ -2509,16 +3159,39 @@ namespace DshManager
         {
             if (runtimes.Count <= 1)
             {
-                MessageBox.Show(this, "至少保留一个实例。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MsgBox.Show(this, "至少保留一个实例。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            DialogResult dr = MessageBox.Show(this, "删除实例「" + rt.Cfg.Name + "」？不会停止其正在运行的服务。", "确认删除",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-            if (dr != DialogResult.Yes) return;
             if (rt.Busy)
             {
-                MessageBox.Show(this, "该实例正在启动/停止/安装中，请稍后再删除。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MsgBox.Show(this, "该实例正在启动/停止/安装中，请稍后再删除。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
+            }
+            // 删除只删配置、不停服务，于是很容易留下"看不见的 DSH 服务"（进程还跑着、界面里没有了）。
+            // 服务确实在运行时，明确问一句要怎么办。
+            int pid = rt.Pid != 0 ? rt.Pid : Native.GetPidByPort(rt.Cfg.Port);
+            bool serviceRunning = (rt.State == SvcState.Running || rt.Proc != null) && pid > 0;
+            if (serviceRunning)
+            {
+                string msg = "实例「" + rt.Cfg.Name + "」的服务正在运行：\n\n"
+                    + "  地址 " + rt.Cfg.Host + ":" + rt.Cfg.Port + " · PID " + pid + "\n\n"
+                    + "删除实例只会从管理器里移除这个条目：\n"
+                    + "  ・「停止并删除」先停止服务，再删除实例（推荐）\n"
+                    + "  ・「仅删除」服务继续在后台运行，管理器里不再显示它\n"
+                    + "    （之后可在「诊断」页的「本机 DSH 服务」里重新纳入管理）";
+                InstanceDeleteChoice choice = InstanceDeleteDialog.Ask(this, msg, rt.Cfg.Name);
+                if (choice == InstanceDeleteChoice.Cancel) return;
+                if (choice == InstanceDeleteChoice.StopAndDelete)
+                {
+                    try { DshService.Stop(rt, true); } catch { }
+                    Thread.Sleep(400);
+                }
+            }
+            else
+            {
+                DialogResult dr = MsgBox.Show(this, "删除实例「" + rt.Cfg.Name + "」？不会停止其正在运行的服务。", "确认删除",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (dr != DialogResult.Yes) return;
             }
             runtimes.Remove(rt);
             Settings.Data.Instances.Remove(rt.Cfg);
@@ -2526,6 +3199,7 @@ namespace DshManager
             selected = runtimes[0];
             RebuildSidebarControl();
             SelectInstance(selected);
+            ScanServices(); // 服务可能已被停止/变成未纳管，重扫一次
         }
 
         void RebuildSidebarControl()
@@ -2681,7 +3355,7 @@ namespace DshManager
                 InstanceRuntime rt = selected;
                 if (rt.State != SvcState.Running && rt.State != SvcState.Starting)
                 {
-                    DialogResult dr = MessageBox.Show(this,
+                    DialogResult dr = MsgBox.Show(this,
                         "服务当前未运行，浏览器会显示“无法连接”。仍要打开吗？",
                         "打开浏览器", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                     if (dr != DialogResult.Yes) return;
@@ -2709,6 +3383,15 @@ namespace DshManager
             headPill = new StatusPill();
             headPill.Width = (int)Ui.P(120);
             page.Controls.Add(headPill);
+
+            // 本机 DSH 服务汇总 / 未纳管告警（点击跳到诊断页处理）
+            lblSvcSummary = new SectionLabel();
+            lblSvcSummary.FontSize = 8.5f;
+            lblSvcSummary.Semibold = false;
+            lblSvcSummary.Visible = false;
+            lblSvcSummary.Cursor = Cursors.Hand;
+            lblSvcSummary.Click += delegate { SwitchTab("diag"); };
+            page.Controls.Add(lblSvcSummary);
 
             // 统计卡片
             stState = new StatCard();
@@ -2761,6 +3444,21 @@ namespace DshManager
             return page;
         }
 
+        // 概览页汇总行的位置依赖状态胶囊的宽度，而胶囊宽度是随文案（"运行中 · PID 1234"）
+        // 在 RefreshOverview 里 FitWidth 变化的——所以每次刷新都要重算，否则会被胶囊压住。
+        void LayoutSvcSummary()
+        {
+            if (lblSvcSummary == null || headPill == null) return;
+            Control page = lblSvcSummary.Parent;
+            if (page == null) return;
+            int M = (int)Ui.P(20);
+            int sx = M + headPill.Width + (int)Ui.P(14);
+            int sw = page.Width - M - sx;
+            if (sw < (int)Ui.P(120)) sw = (int)Ui.P(120);
+            lblSvcSummary.Location = new Point(sx, (int)Ui.P(50));
+            lblSvcSummary.Size = new Size(sw, (int)Ui.P(24));
+        }
+
         void LayoutOverview(Control page)
         {
             int W = page.Width;
@@ -2780,6 +3478,7 @@ namespace DshManager
             btnStart.Location = new Point(bx < minX ? minX : bx, by);
 
             headPill.Location = new Point(M, (int)Ui.P(48));
+            LayoutSvcSummary();
 
             // 三张统计卡：平分可用宽度
             int cw = (W - M * 2 - G * 2) / 3;
@@ -2831,7 +3530,7 @@ namespace DshManager
             btnClear.Label = "清空显示";
             btnClear.Location = new Point((int)Ui.P(170), (int)Ui.P(7));
             btnClear.Size = new Size((int)Ui.P(84), (int)Ui.P(32));
-            btnClear.Click += delegate { logView.ClearAll(); logPos.Clear(); logFile.Clear(); logCarry.Clear(); };
+            btnClear.Click += delegate { logView.ClearAll(); logPos.Clear(); logFile.Clear(); logCarry.Clear(); logEmptyHintShown = false; };
             bar.Controls.Add(btnClear);
 
             PillButton btnOpen = new PillButton();
@@ -2999,6 +3698,12 @@ namespace DshManager
                 {
                     c.BackColor = Theme.Current.LogBack;
                     c.ForeColor = Theme.Current.LogText;
+                    // RichTextBox 的滚动条属于"非客户区"，不跟随深色主题：单独通知 uxtheme 换深色部件
+                    if (c.IsHandleCreated)
+                    {
+                        Native.AllowDarkModeForWindow(c.Handle, Theme.Current.IsDark);
+                        Native.ApplyDarkScrollbars(c.Handle, Theme.Current.IsDark);
+                    }
                 }
                 else if (c is TextBox)
                 {
@@ -3039,7 +3744,7 @@ namespace DshManager
             btnRe.Label = "重新检测";
             btnRe.Location = new Point((int)Ui.P(14), (int)Ui.P(7));
             btnRe.Size = new Size((int)Ui.P(96), (int)Ui.P(32));
-            btnRe.Click += delegate { RunDiag(); };
+            btnRe.Click += delegate { RunDiag(); ScanServices(); }; // 一并重新扫描本机 DSH 服务
             bar.Controls.Add(btnRe);
 
             PillButton btnCopy = new PillButton();
@@ -3067,10 +3772,31 @@ namespace DshManager
             bar.Controls.Add(btnInstall);
 
             // 手动指定 node/dsh 路径（适配源码仓库/自建安装等非标准方式）
+            // 与"未纳管服务"动作条一起放进底部容器，避免多个 Dock=Bottom 控件的叠放顺序不确定
+            BaseControl bottomStack = new BaseControl();
+            bottomStack.Dock = DockStyle.Bottom;
+            bottomStack.Height = (int)Ui.P(92 + 46);
+            page.Controls.Add(bottomStack);
+
+            // 未纳管的 DSH 服务：动作条（纳入管理 / 停止），内容每次扫描后重建
+            servicesBar = new BaseControl();
+            servicesBar.Dock = DockStyle.Top;
+            servicesBar.Height = (int)Ui.P(46);
+            bottomStack.Controls.Add(servicesBar);
+
+            lblSvcBar = new SectionLabel();
+            lblSvcBar.Caption = "本机 DSH 服务：扫描中…";
+            lblSvcBar.FontSize = 8.5f;
+            // 宽度必须小于按钮起始 x（190）：SectionLabel 是普通控件，会用页面底色刷自己的矩形，
+            // 一旦与按钮重叠就会把按钮"擦"掉一截（实测把 Primary 按钮刷成上下两条蓝边）。
+            lblSvcBar.Location = new Point((int)Ui.P(14), (int)Ui.P(13));
+            lblSvcBar.Size = new Size((int)Ui.P(168), (int)Ui.P(20));
+            servicesBar.Controls.Add(lblSvcBar);
+
             BaseControl pathBar = new BaseControl();
             pathBar.Dock = DockStyle.Bottom;
             pathBar.Height = (int)Ui.P(92);
-            page.Controls.Add(pathBar);
+            bottomStack.Controls.Add(pathBar);
 
             Label lNode = new Label();
             lNode.Text = "node.exe（可选）";
@@ -3305,8 +4031,8 @@ namespace DshManager
             lblEnvInfo.BackColor = Color.Transparent;
             lblEnvInfo.ForeColor = Theme.Current.TextMuted;
             lblEnvInfo.Font = new Font("Consolas", 9f);
-            lblEnvInfo.Location = new Point((int)Ui.P(34), (int)Ui.P(272));
-            lblEnvInfo.Size = new Size((int)Ui.P(560), (int)Ui.P(84)); // 容纳 DSH_WEB_URL/提示等更多行
+            lblEnvInfo.Location = new Point((int)Ui.P(34), (int)Ui.P(270));
+            lblEnvInfo.Size = new Size((int)Ui.P(560), (int)Ui.P(92)); // 一行一项：最多 5 行（含 DSH_WEB_URL/提示）
             page.Controls.Add(lblEnvInfo);
 
             PillButton btnLogOpen = new PillButton();
@@ -3325,7 +4051,7 @@ namespace DshManager
             page.Controls.Add(btnLogOpen);
 
             // ── 链接行 ──
-            int ly = (int)Ui.P(362);
+            int ly = (int)Ui.P(374);
             PillButton btnDoc = LinkButton(page, "DeepSeek Harness 文档", "https://www.npmjs.com/package/@deepseek-ai/dsh", ly);
             PillButton btnRepo = LinkButton(page, "GitHub 仓库", "https://github.com/wuxingyuyouxing/DeepSeek-Harness-Manager", ly);
             PillButton btnRel = LinkButton(page, "更新记录", "https://github.com/wuxingyuyouxing/DeepSeek-Harness-Manager/releases", ly);
@@ -3359,7 +4085,7 @@ namespace DshManager
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
                 RectangleF rc1 = new RectangleF((int)Ui.P(14), (int)Ui.P(78), page.Width - (int)Ui.P(28), (int)Ui.P(150));
                 using (Pen p = new Pen(T.Border)) Draw.StrokeRound(e.Graphics, p, rc1, Ui.P(10));
-                RectangleF rc2 = new RectangleF((int)Ui.P(14), (int)Ui.P(236), page.Width - (int)Ui.P(28), (int)Ui.P(112));
+                RectangleF rc2 = new RectangleF((int)Ui.P(14), (int)Ui.P(236), page.Width - (int)Ui.P(28), (int)Ui.P(130));
                 using (Pen p = new Pen(T.Border)) Draw.StrokeRound(e.Graphics, p, rc2, Ui.P(10));
             };
 
@@ -3463,9 +4189,10 @@ namespace DshManager
             bool homeExplicit = !string.IsNullOrEmpty(home);
             if (!homeExplicit) home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
             string url = Environment.GetEnvironmentVariable("DSH_WEB_URL");
+            // 一行一项：之前把 node/dsh/DSH_HOME 挤在同一行，宽度不够时会在词中间折断（"（默 / 认）"）
             string envInfo = "node " + (DshService.NodeVersion.Length > 0 ? DshService.NodeVersion : "未知")
-                + "    dsh " + (localDsh != "未知" ? localDsh : "未知")
-                + "    DSH_HOME: " + home + (homeExplicit ? "" : "（默认）") + "\n"
+                + "   ·   dsh " + (localDsh != "未知" ? localDsh : "未知") + "\n"
+                + "DSH_HOME: " + home + (homeExplicit ? "" : "（默认）") + "\n"
                 + (!string.IsNullOrEmpty(url) ? "DSH_WEB_URL: " + url + "\n" : "") // 环境变量可能不存在(null)，勿直接 .Length
                 + "应用目录: " + Settings.AppDir + "\n"
                 + "日志目录: " + Settings.LogsDir;
@@ -3540,7 +4267,7 @@ namespace DshManager
         {
             if (!DshUpgradeable())
             {
-                MessageBox.Show(this, "当前 dsh 来自手动指定/自定义路径，无法一键升级。\n请到「诊断」页查看 dsh 入口路径并自行更新。", trackLabel, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MsgBox.Show(this, "当前 dsh 来自手动指定/自定义路径，无法一键升级。\n请到「诊断」页查看 dsh 入口路径并自行更新。", trackLabel, MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             // 兜底：目标版本不高于本地时不白跑安装
@@ -3548,7 +4275,7 @@ namespace DshManager
             if (targetVersion.Length > 0 && localDsh.Length > 0 &&
                 UpdateService.CompareVersions(targetVersion, localDsh) <= 0)
             {
-                MessageBox.Show(this, "dsh 已是最新版本（" + localDsh + "），无需升级。", trackLabel, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MsgBox.Show(this, "dsh 已是最新版本（" + localDsh + "），无需升级。", trackLabel, MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             InstallDsh(btn, trackLabel, targetVersion);
@@ -3561,24 +4288,24 @@ namespace DshManager
             if (UpdateService.ManagerLatestUrl.Length == 0)
             {
                 CheckUpdates();
-                MessageBox.Show(this, "正在检查更新，请稍后在「关于」页查看结果。", "更新管理器", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MsgBox.Show(this, "正在检查更新，请稍后在「关于」页查看结果。", "更新管理器", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             string cur = Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
             if (UpdateService.ManagerLatest.Length == 0 || UpdateService.CompareVersions(UpdateService.ManagerLatest, cur) <= 0)
             {
-                MessageBox.Show(this, "当前已是最新版本。", "更新管理器", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MsgBox.Show(this, "当前已是最新版本。", "更新管理器", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             // 安装版：不自动替换（避免破坏安装器/卸载入口），引导走 Setup 升级
             if (IsInstalledVersion())
             {
-                MessageBox.Show(this, "检测到当前为安装版安装。为避免破坏安装器与卸载功能，请下载 Setup 安装包重新运行安装向导完成升级（配置与日志会保留）。\n\n即将打开下载页…",
+                MsgBox.Show(this, "检测到当前为安装版安装。为避免破坏安装器与卸载功能，请下载 Setup 安装包重新运行安装向导完成升级（配置与日志会保留）。\n\n即将打开下载页…",
                     "更新管理器", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 OpenUrl("https://github.com/wuxingyuyouxing/DeepSeek-Harness-Manager/releases/latest");
                 return;
             }
-            if (MessageBox.Show(this, "发现新版本 v" + UpdateService.ManagerLatest + "。\n将下载便携包（约 36MB）并替换当前程序，完成后自动重启管理器。\n\n继续吗？",
+            if (MsgBox.Show(this, "发现新版本 v" + UpdateService.ManagerLatest + "。\n将下载便携包（约 36MB）并替换当前程序，完成后自动重启管理器。\n\n继续吗？",
                 "更新管理器", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
 
             aboutBusy = true;
@@ -3642,7 +4369,7 @@ namespace DshManager
             if (err.Length > 0)
             {
                 if (lblAboutMgrStatus != null) { lblAboutMgrStatus.Caption = err; lblAboutMgrStatus.Invalidate(); }
-                MessageBox.Show(this, err, "更新管理器", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MsgBox.Show(this, err, "更新管理器", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
@@ -3740,7 +4467,7 @@ namespace DshManager
             if (DshService.NodeExe.Length == 0) DshService.Resolve();
             if (DshService.NodeExe.Length == 0)
             {
-                MessageBox.Show(this, "未找到 node.exe，无法安装 dsh。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MsgBox.Show(this, "未找到 node.exe，无法安装 dsh。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
             if (installingDsh) return;
@@ -3758,7 +4485,7 @@ namespace DshManager
             {
                 string msg = "检测到 " + toRestart.Count + " 个 dsh 实例正在运行。\n"
                     + "安装/升级将替换 dsh 程序文件，为避免破坏正在运行的服务，会先停止这些实例，完成后自动重启。\n\n继续吗？";
-                if (MessageBox.Show(this, msg, doneLabel, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                if (MsgBox.Show(this, msg, doneLabel, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
                 {
                     btn.Enabled = true;
                     btn.Label = doneLabel;
@@ -3864,7 +4591,7 @@ namespace DshManager
                         if (timedOut)
                         {
                             AppendDiag("安装超时（30 分钟），已终止安装进程。请检查网络后重试。", Theme.Current.LogErr);
-                            MessageBox.Show(this, "安装超时（30 分钟），已终止安装进程。\n请检查网络后重试。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            MsgBox.Show(this, "安装超时（30 分钟），已终止安装进程。\n请检查网络后重试。", "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                             restoreInstances(); // 安装未完成，dsh 未被改动，按原版本恢复服务
                             RefreshAbout();
                             return;
@@ -3894,12 +4621,12 @@ namespace DshManager
                         if (ok)
                         {
                             AppendDiag("安装完成：" + DshService.BinJs + "（版本 " + DshService.DshVersion + "）", Theme.Current.LogText);
-                            MessageBox.Show(this, "dsh 安装成功：" + DshService.BinJs + "\n版本：" + DshService.DshVersion, "安装完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                            MsgBox.Show(this, "dsh 安装成功：" + DshService.BinJs + "\n版本：" + DshService.DshVersion, "安装完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
                         }
                         else
                         {
                             AppendDiag("升级未成功：dsh 当前仍为 " + DshService.DshVersion + "，目标 " + targetVersion + "。请查看上方 npm 日志（常见原因：网络问题或 npm 缓存过期）。", Theme.Current.LogErr);
-                            MessageBox.Show(this, "升级未成功：dsh 当前仍为 " + DshService.DshVersion + "，目标 " + targetVersion + "。\n请查看诊断日志中的 npm 报错，可稍后重试。", "升级失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            MsgBox.Show(this, "升级未成功：dsh 当前仍为 " + DshService.DshVersion + "，目标 " + targetVersion + "。\n请查看诊断日志中的 npm 报错，可稍后重试。", "升级失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                         }
                         restoreInstances(); // 无论成败都恢复服务（失败则按旧版本继续运行，服务不中断）
                         RefreshAbout();     // 完成后立即刷新 About 页版本显示
@@ -3911,6 +4638,12 @@ namespace DshManager
         void RunDiag()
         {
             if (diagBox == null) return;
+            // 诊断框此刻一定已创建句柄（切到本页时）：补一次深色滚动条设置
+            if (diagBox.IsHandleCreated)
+            {
+                Native.AllowDarkModeForWindow(diagBox.Handle, Theme.Current.IsDark);
+                Native.ApplyDarkScrollbars(diagBox.Handle, Theme.Current.IsDark);
+            }
             diagBox.Clear();
             // 标准查找失败时，尝试从运行中的实例反向发现（适配源码仓库等安装方式）
             if (DshService.NodeExe.Length == 0 || DshService.BinJs.Length == 0)
@@ -3948,6 +4681,210 @@ namespace DshManager
                     AppendDiag("    如需局域网使用，可用反向代理将 127.0.0.1:" + selected.Cfg.Port + " 暴露到局域网。", Theme.Current.LogText);
                 }
             }
+            AppendDiag("", Theme.Current.LogText);
+            AppendDiag("本机 DSH 服务", Theme.Current.Accent);
+            if (svcScanning && svcList == null)
+            {
+                AppendDiag("  正在扫描…", Theme.Current.LogText);
+            }
+            else if (svcList == null || svcList.Count == 0)
+            {
+                AppendDiag("  未检测到正在运行的 DSH 服务。", Theme.Current.LogText);
+            }
+            else
+            {
+                foreach (DshService.LocalDshService s in svcList)
+                {
+                    InstanceRuntime owner = HostingInstance(s.Port);
+                    string line = "  端口 " + s.Port + " · PID " + s.Pid + " · " + s.MemMb + " MB";
+                    if (s.StartedAt != DateTime.MinValue) line += " · 启动 " + s.StartedAt.ToString("MM-dd HH:mm:ss");
+                    line += owner != null ? " · 已纳管（" + owner.Cfg.Name + "）" : " · 未纳管";
+                    AppendDiag(line, owner != null ? Theme.Current.LogText : Theme.Current.LogWarn);
+                }
+                AppendDiag("  判据：node 进程 + 命令行是 dsh 的 bin.js 入口 + 正在监听端口（dsh 的内部子进程不计）。", Theme.Current.TextMuted);
+            }
+            RefreshServiceActions();
+        }
+
+        // 本机 DSH 服务扫描结果（UI 线程读写）
+        List<DshService.LocalDshService> svcList;
+        bool svcScanning;
+
+        // 该端口是否已被某个实例纳管（同端口即同一服务）
+        InstanceRuntime HostingInstance(int port)
+        {
+            foreach (InstanceRuntime rt in runtimes) if (rt.Cfg.Port == port) return rt;
+            return null;
+        }
+
+        // 后台扫描（WMI + TCP 表，不阻塞 UI）；扫描完成后刷新概览汇总与诊断页
+        void ScanServices()
+        {
+            if (svcScanning) return;
+            svcScanning = true;
+            Task.Run(delegate
+            {
+                List<DshService.LocalDshService> found = DshService.ScanLocalServices();
+                SafeInvoke(delegate
+                {
+                    svcScanning = false;
+                    svcList = found;
+                    RefreshServiceSummary();
+                    if (activeTab == "diag") RunDiag();
+                });
+            });
+        }
+
+        int UnmanagedCount()
+        {
+            if (svcList == null) return 0;
+            int n = 0;
+            foreach (DshService.LocalDshService s in svcList) if (HostingInstance(s.Port) == null) n++;
+            return n;
+        }
+
+        // 概览页一行汇总：本机有几个 DSH 服务、有几个没纳管（未纳管时点一下跳到诊断页）
+        void RefreshServiceSummary()
+        {
+            if (lblSvcSummary == null) return;
+            if (svcList == null)
+            {
+                lblSvcSummary.Caption = svcScanning ? "正在扫描本机 DSH 服务…" : "";
+                lblSvcSummary.CustomColor = Theme.Current.TextMuted;
+            }
+            else if (svcList.Count == 0)
+            {
+                lblSvcSummary.Caption = "本机未检测到运行中的 DSH 服务";
+                lblSvcSummary.CustomColor = Theme.Current.TextMuted;
+            }
+            else
+            {
+                int un = UnmanagedCount();
+                if (un == 0)
+                {
+                    lblSvcSummary.Caption = "本机 DSH 服务 " + svcList.Count + " 个 · 全部已纳管";
+                    lblSvcSummary.CustomColor = Theme.Current.TextMuted;
+                }
+                else
+                {
+                    string ports = "";
+                    foreach (DshService.LocalDshService s in svcList)
+                    {
+                        if (HostingInstance(s.Port) != null) continue;
+                        if (ports.Length > 0) ports += "、";
+                        ports += s.Port;
+                    }
+                    lblSvcSummary.Caption = "⚠ 本机 DSH 服务 " + svcList.Count + " 个 · " + un + " 个未纳管（端口 " + ports + "）· 点此处到「诊断」页处理";
+                    lblSvcSummary.CustomColor = Theme.Current.Warn;
+                }
+            }
+            lblSvcSummary.Visible = lblSvcSummary.Caption.Length > 0;
+            lblSvcSummary.Invalidate();
+        }
+
+        // 诊断页动作条：为每个"未纳管"的服务生成 [纳入管理] [停止] 两个按钮
+        void RefreshServiceActions()
+        {
+            if (servicesBar == null) return;
+            List<Control> kill = new List<Control>();
+            foreach (Control c in servicesBar.Controls) if (c is PillButton) kill.Add(c);
+            foreach (Control c in kill) { servicesBar.Controls.Remove(c); c.Dispose(); }
+
+            if (lblSvcBar != null)
+            {
+                int un = UnmanagedCount();
+                lblSvcBar.Caption = svcList == null ? "本机 DSH 服务：扫描中…"
+                    : (un == 0 ? "本机 DSH 服务均已纳管" : "未纳管 " + un + " 个 →");
+                lblSvcBar.CustomColor = un > 0 ? Theme.Current.Warn : Theme.Current.TextMuted;
+                lblSvcBar.Invalidate();
+            }
+            if (svcList == null || servicesBar == null) return;
+
+            int x = (int)Ui.P(190);
+            int maxX = servicesBar.Width - (int)Ui.P(20);
+            int shown = 0, total = 0;
+            foreach (DshService.LocalDshService s in svcList)
+            {
+                if (HostingInstance(s.Port) != null) continue;
+                total++;
+                if (total > 4) continue; // 极端情况下（一堆未纳管服务）不铺满整行
+                int w1 = (int)Ui.P(104), w2 = (int)Ui.P(84);
+                if (x + w1 + w2 + (int)Ui.P(8) > maxX) break;
+                DshService.LocalDshService cap = s;
+                PillButton adopt = new PillButton();
+                adopt.Kind = PillButton.Variant.Primary;
+                adopt.Label = "纳入管理 " + s.Port;
+                adopt.Location = new Point(x, (int)Ui.P(7));
+                adopt.Size = new Size(w1, (int)Ui.P(32));
+                adopt.Click += delegate { AdoptService(cap); };
+                servicesBar.Controls.Add(adopt);
+                x += w1 + (int)Ui.P(8);
+
+                PillButton stop = new PillButton();
+                stop.Kind = PillButton.Variant.Ghost;
+                stop.Label = "停止 " + s.Port;
+                stop.Location = new Point(x, (int)Ui.P(7));
+                stop.Size = new Size(w2, (int)Ui.P(32));
+                stop.Click += delegate { StopUnmanagedService(cap); };
+                servicesBar.Controls.Add(stop);
+                x += w2 + (int)Ui.P(14);
+                shown++;
+            }
+            if (total > shown && shown > 0)
+            {
+                SectionLabel more = new SectionLabel();
+                more.Caption = "（还有 " + (total - shown) + " 个未纳管服务，见上方列表）";
+                more.FontSize = 8f;
+                more.Location = new Point(x, (int)Ui.P(13));
+                more.Size = new Size((int)Ui.P(240), (int)Ui.P(18));
+                servicesBar.Controls.Add(more);
+            }
+            // 汇总标签置底：即便文案变长也不允许它盖住按钮（见上面 lblSvcBar 的说明）
+            if (lblSvcBar != null) lblSvcBar.SendToBack();
+        }
+
+        // 把扫描到的服务纳入管理：按该端口建一个实例，之后就能正常启停/看日志
+        void AdoptService(DshService.LocalDshService s)
+        {
+            if (HostingInstance(s.Port) != null)
+            {
+                MsgBox.Show(this, "端口 " + s.Port + " 已经由实例「" + HostingInstance(s.Port).Cfg.Name + "」管理。", "纳入管理", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            InstanceConfig cfg = new InstanceConfig();
+            cfg.Name = UniqueInstanceName("DSH-" + s.Port, null);
+            cfg.Host = "127.0.0.1";
+            cfg.Port = s.Port;
+            cfg.AutoOpenBrowser = false;
+            cfg.Watchdog = false;
+            cfg.ManualStopped = false;
+            InstanceRuntime rt = new InstanceRuntime();
+            rt.Cfg = cfg;
+            runtimes.Add(rt);
+            Settings.Data.Instances.Add(cfg);
+            Settings.Save();
+            SelectInstance(rt);
+            RebuildSidebarControl();
+            PollStates(); // 立即探测，状态/ PID 秒出
+            ScanServices(); // 重新扫描：该服务变为"已纳管"
+            try { tray.ShowBalloonTip(4000, "已纳入管理", "实例「" + cfg.Name + "」（127.0.0.1:" + s.Port + "）已加入实例列表。", ToolTipIcon.Info); } catch { }
+        }
+
+        // 停止一个未被纳管的 DSH 服务（直接结束进程树）
+        void StopUnmanagedService(DshService.LocalDshService s)
+        {
+            string msg = "停止本机 DSH 服务？\n\n"
+                + "  端口 " + s.Port + " · PID " + s.Pid + "\n"
+                + "  启动于 " + (s.StartedAt != DateTime.MinValue ? s.StartedAt.ToString("MM-dd HH:mm:ss") : "未知") + "\n\n"
+                + "该进程不在实例列表里（未纳管），将直接结束它的进程树（含子进程）。";
+            if (MsgBox.Show(this, msg, "停止服务", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            int pid = s.Pid;
+            Task.Run(delegate
+            {
+                DshService.KillProcessTree(pid);
+                Thread.Sleep(600);
+                SafeInvoke(delegate { ScanServices(); RefreshOverview(); });
+            });
         }
 
         void AppendDiag(string line, Color c)
@@ -4074,6 +5011,7 @@ namespace DshManager
                 headPill.Label = stText + (st == SvcState.Running && selected.Pid != 0 ? " · PID " + selected.Pid : "");
                 headPill.FitWidth();
                 headPill.Invalidate();
+                LayoutSvcSummary();
             }
 
             if (stState != null)
@@ -4218,6 +5156,7 @@ namespace DshManager
         Dictionary<string, string> logFile = new Dictionary<string, string>();
         Dictionary<string, byte[]> logCarry = new Dictionary<string, byte[]>(); // 跨轮询保留的 UTF-8 不完整尾部字节
         const int LogChunk = 64 * 1024; // 单次最多读取的日志字节数（避免整读超大日志分配大数组）
+        bool logEmptyHintShown;         // 日志页是否已显示"暂无日志"占位说明（有日志/切换实例/清空时复位）
         // ANSI 转义：颜色(CSI SGR)、光标移动/清屏(CSI)、OSC、其他 C1/双字节转义全部剔除，避免日志页出现乱码
         static readonly Regex AnsiRe = new Regex(
             "\u001b\\[[0-9;?]*[ -/]*[@-~]|\u001b\\][^\u0007\u001b]*(\u0007|\u001b\\\\)|\u001b[@-Z\\\\_-]");
@@ -4229,16 +5168,27 @@ namespace DshManager
             public LogSrc(string p, bool e) { Path = p; IsErr = e; }
         }
 
-        // 按时间先后收集所选实例的 stdout(.out.log) + stderr(.err.log) 全部日志文件
-        LogSrc[] GetLogFiles(string slug)
+        // 按时间先后收集所选实例的 stdout(.out.log) + stderr(.err.log) 全部日志文件。
+        // 匹配用**端口**而不是实例名（slug）：日志文件名是 <名字slug>-<端口>-<yyyyMMdd>-<HHmmss>.{out,err}.log，
+        // 端口是稳定标识，而改名会让 slug 变化——实测实例从"本地实例"改名成"DSH-1"后，
+        // logs 里 17 组 -----3080-*.log（含当时正在跑的服务的日志）在日志页全部消失。
+        // 管理器已强制 host:port 唯一，按端口归属不会串台。
+        LogSrc[] GetLogFiles(int port)
         {
             List<LogSrc> res = new List<LogSrc>();
             try
             {
                 if (!Directory.Exists(Settings.LogsDir)) return res.ToArray();
-                res.AddRange(Directory.GetFiles(Settings.LogsDir, slug + "-*.out.log").Select(f => new LogSrc(f, false)));
-                res.AddRange(Directory.GetFiles(Settings.LogsDir, slug + "-*.err.log").Select(f => new LogSrc(f, true)));
-                if (res.Count == 0) // 兼容旧 npx 缓存布局
+                // 不用 "*-<port>-*.log" 宽松通配（实例名叫 x-3080、端口 6090 时会误匹配），
+                // 枚举后按正则锁定文件名结尾
+                Regex pat = new Regex("-" + port + "-\\d{8}-\\d{6}\\.(out|err)\\.log$", RegexOptions.IgnoreCase);
+                foreach (string f in Directory.GetFiles(Settings.LogsDir, "*.log"))
+                {
+                    Match m = pat.Match(Path.GetFileName(f));
+                    if (!m.Success) continue;
+                    res.Add(new LogSrc(f, m.Groups[1].Value.Equals("err", StringComparison.OrdinalIgnoreCase)));
+                }
+                if (res.Count == 0) // 兼容外部启动器布局（dsh-web-*.log 文件名不含端口，无法归属具体实例）
                 {
                     res.AddRange(Directory.GetFiles(Settings.LogsDir, "dsh-web-*.out.log").Select(f => new LogSrc(f, false)));
                     res.AddRange(Directory.GetFiles(Settings.LogsDir, "dsh-web-*.err.log").Select(f => new LogSrc(f, true)));
@@ -4252,12 +5202,32 @@ namespace DshManager
         void RefreshLogs()
         {
             if (selected == null || logView == null || !logView.Visible) return;
+            int port = selected.Cfg.Port;
             string slug = selected.Cfg.Slug;
-            LogSrc[] files = GetLogFiles(slug);
+            LogSrc[] files = GetLogFiles(port);
+            if (files.Length > 0 && logEmptyHintShown)
+            {
+                // 之前只有"暂无日志"占位说明，现在有日志了：清掉占位并从头读，避免两者混在一起
+                logView.ClearAll();
+                logPos.Clear();
+                logFile.Clear();
+                logCarry.Clear();
+                logEmptyHintShown = false;
+            }
+            if (files.Length == 0)
+            {
+                // 空状态也要给一句说明，否则用户对着空白面板不知道是没日志还是坏了
+                if (!logEmptyHintShown)
+                {
+                    logEmptyHintShown = true;
+                    logView.AppendLine("（暂无日志：该实例还没有运行日志。点「启动」后，服务输出会实时显示在这里）", 0, false);
+                }
+                return;
+            }
             foreach (LogSrc s in files)
             {
                 string f = s.Path;
-                string key = slug + "|" + (s.IsErr ? "e" : "o") + "|" + Path.GetFileName(f);
+                string key = port + "|" + (s.IsErr ? "e" : "o") + "|" + Path.GetFileName(f);
                 long pos = 0;
                 logPos.TryGetValue(key, out pos);
                 string prev = "";
@@ -4426,7 +5396,7 @@ namespace DshManager
                         {
                             // 手动启动失败：抑制看门狗自动重试，直到用户再次手动操作
                             rt.Cfg.ManualStopped = true;
-                            MessageBox.Show(this, "启动失败：" + rt.LastError +
+                            MsgBox.Show(this, "启动失败：" + rt.LastError +
                                 "\n\n可到「诊断」页查看 node/dsh 状态，或点击「一键安装 dsh」。",
                                 "DeepSeek Harness", MessageBoxButtons.OK, MessageBoxIcon.Error);
                         }
@@ -4450,7 +5420,7 @@ namespace DshManager
                         }
                     }
                     else if (final == SvcState.Occupied)
-                        MessageBox.Show(this, "端口 " + rt.Cfg.Port + " 已被其他进程占用。", "DeepSeek Harness", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        MsgBox.Show(this, "端口 " + rt.Cfg.Port + " 已被其他进程占用。", "DeepSeek Harness", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     else if (final == SvcState.Stopped || final == SvcState.Starting)
                     {
                         // 启动超时 / 进程启动后即退出：如实反馈，避免状态悬在"启动中"无人知晓
@@ -4458,7 +5428,7 @@ namespace DshManager
                         if (!silent)
                         {
                             rt.Cfg.ManualStopped = true;
-                            MessageBox.Show(this, "服务未能启动（当前状态：" + (final == SvcState.Starting ? "仍在启动中，已超过 90 秒" : "进程已退出") + "）。\n请查看「日志」页了解详情。",
+                            MsgBox.Show(this, "服务未能启动（当前状态：" + (final == SvcState.Starting ? "仍在启动中，已超过 90 秒" : "进程已退出") + "）。\n请查看「日志」页了解详情。",
                                 "DeepSeek Harness", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                         }
                     }
@@ -4522,7 +5492,7 @@ namespace DshManager
                         rt.FailCount++;
                         rt.Cfg.ManualStopped = true; // 失败后抑制看门狗自动重试
                         string why = final == SvcState.Stopped ? "进程已退出" : (final == SvcState.Starting ? "仍在启动中，已超过 90 秒" : final.ToString());
-                        MessageBox.Show(this, "重启失败：服务未能启动（当前状态：" + why + "）。\n请查看「日志」页了解详情。",
+                        MsgBox.Show(this, "重启失败：服务未能启动（当前状态：" + why + "）。\n请查看「日志」页了解详情。",
                             "DeepSeek Harness", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     }
                     UpdateSelectedUi();
