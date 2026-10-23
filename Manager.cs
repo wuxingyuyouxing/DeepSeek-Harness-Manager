@@ -12,6 +12,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -29,8 +30,8 @@ using Timer = System.Windows.Forms.Timer;
 [assembly: AssemblyProduct("DeepSeek Harness Manager")]
 [assembly: AssemblyCompany("DeepSeek Harness")]
 [assembly: AssemblyCopyright("Copyright © 2026 DeepSeek Harness")]
-[assembly: AssemblyVersion("1.2.7.0")]
-[assembly: AssemblyFileVersion("1.2.7.0")]
+[assembly: AssemblyVersion("1.2.8.0")]
+[assembly: AssemblyFileVersion("1.2.8.0")]
 
 namespace DshManager
 {
@@ -1029,18 +1030,7 @@ namespace DshManager
             catch { }
         }
 
-        // DSH 0.1.x-rc 系列均拒绝 --host 0.0.0.0（防远程代码执行），不支持局域网绑定：
-        //   dsh-web-app 启动时硬性报错"intentionally not supported yet for safety"，
-        //   且 webserver 配置只允许 "127.0.0.1" | "0.0.0.0"。
-        // 版本未知时保守按"不支持"。DSH 未来放开 0.0.0.0 后，此判断需相应更新。
-        public static bool SupportsLan()
-        {
-            string v = DshVersion;
-            if (v.Length == 0) return false;
-            return !Regex.IsMatch(v, @"^0\.1\.\d+-rc", RegexOptions.IgnoreCase);
-        }
-
-        // 绑定地址是否为 IPv4 字面量（127.0.0.1 / 0.0.0.0 / 192.168.x.x …）。
+                // 绑定地址是否为 IPv4 字面量（127.0.0.1 / 0.0.0.0 / 192.168.x.x …）。
         // 只有 IPv4 字面量才可用 IPv4 TCP 表判定"端口上有没有监听者"；主机名/IPv6 监听
         // 不出现在 IPv4 表中，此时必须走 HTTP 探测，否则会误报"已停止"。
         static bool IsIpv4Literal(string host)
@@ -1908,7 +1898,15 @@ namespace DshManager
 
             Font ft = new Font("Segoe UI", 9f, FontStyle.Regular);
             Draw.Text(g, Title, ft, T.TextMuted, new RectangleF(Ui.P(14), Ui.P(12), Width - Ui.P(28), Ui.P(18)), ContentAlignment.MiddleLeft);
-            Font fv = new Font("Segoe UI Semibold", 15f, FontStyle.Regular);
+            // 值过长（如 "192.168.135.145:3099"）时逐级缩小字号，避免被裁成 "192.168.135.145:30"
+            float vSize = 15f;
+            Font fv = new Font("Segoe UI Semibold", vSize, FontStyle.Regular);
+            while (vSize > 9f && g.MeasureString(Value, fv).Width > Width - Ui.P(28))
+            {
+                vSize -= 1f;
+                fv.Dispose();
+                fv = new Font("Segoe UI Semibold", vSize, FontStyle.Regular);
+            }
             Draw.Text(g, Value, fv, ValueColor == Color.Empty ? T.Text : ValueColor,
                 new RectangleF(Ui.P(14), Ui.P(30), Width - Ui.P(28), Ui.P(26)), ContentAlignment.MiddleLeft);
             Font fs = new Font("Segoe UI", 8.5f, FontStyle.Regular);
@@ -2360,6 +2358,305 @@ namespace DshManager
             stop.Location = new Point(only.Left - gap - btnW, y);
             stop.Click += delegate { Choice = InstanceDeleteChoice.StopAndDelete; Close(); };
             Controls.Add(stop);
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────── 局域网地址探测
+    // 背景：dsh 0.1.x-rc 拒绝 --host 0.0.0.0；0.2.x 的策略是"必须绑某个具体 IPv4/IPv6"，
+    // 所以"局域网访问"= 把实例的绑定地址改成某个真实网卡 IP（不是猜一个 IP 显示出来）。
+    // 这里负责列出可用网卡地址：排除回环/APIPA(169.254)/虚拟网卡(VirtualBox、VMware、Hyper-V、
+    // Docker、WSL、TAP 等)，默认网关所在网卡优先。原实现取 Dns.GetHostEntry 的第一个非回环 IPv4，
+    // 实测在本机会选到 VirtualBox Host-Only 的 192.168.56.1（别的机器根本到不了）。
+    class LanCandidate
+    {
+        public string Ip = "";
+        public string Adapter = "";
+        public string Description = "";
+        public bool Virtual;
+        public bool HasGateway;
+        public string Label
+        {
+            get { return Ip + "   ·   " + (Adapter.Length > 0 ? Adapter : Description) + (Virtual ? "（虚拟网卡）" : "") + (HasGateway ? "" : "（无网关）"); }
+        }
+    }
+
+    static class Lan
+    {
+        static readonly string[] VirtualHints = new string[]
+        {
+            "virtual", "vmware", "virtualbox", "hyper-v", "vethernet", "docker", "wsl",
+            "tap-", "tun", "npcap", "loopback", "vmnet", "vbox", "zerotier", "tailscale"
+        };
+
+        public static List<LanCandidate> Candidates()
+        {
+            List<LanCandidate> res = new List<LanCandidate>();
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Tunnel) continue;
+                    string desc = (ni.Description ?? "") + " " + (ni.Name ?? "");
+                    string low = desc.ToLowerInvariant();
+                    bool virt = false;
+                    foreach (string h in VirtualHints) { if (low.IndexOf(h, StringComparison.OrdinalIgnoreCase) >= 0) { virt = true; break; } }
+                    bool gw = false;
+                    try
+                    {
+                        foreach (GatewayIPAddressInformation g in ni.GetIPProperties().GatewayAddresses)
+                        {
+                            if (g.Address != null && g.Address.AddressFamily == AddressFamily.InterNetwork) { gw = true; break; }
+                        }
+                    }
+                    catch { }
+                    foreach (UnicastIPAddressInformation ua in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (ua.Address == null || ua.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                        string ip = ua.Address.ToString();
+                        if (ip.StartsWith("127.") || ip.StartsWith("169.254.")) continue; // 回环 / APIPA 自动地址
+                        LanCandidate c = new LanCandidate();
+                        c.Ip = ip;
+                        c.Adapter = ni.Name;
+                        c.Description = ni.Description;
+                        c.Virtual = virt;
+                        c.HasGateway = gw;
+                        res.Add(c);
+                    }
+                }
+            }
+            catch { }
+            // 排序：真实网卡 + 有网关 > 真实网卡 > 虚拟网卡；同组内按 IP 稳定排序
+            res.Sort(delegate(LanCandidate a, LanCandidate b)
+            {
+                int ra = a.Virtual ? (a.HasGateway ? 2 : 3) : (a.HasGateway ? 0 : 1);
+                int rb = b.Virtual ? (b.HasGateway ? 2 : 3) : (b.HasGateway ? 0 : 1);
+                if (ra != rb) return ra.CompareTo(rb);
+                return string.CompareOrdinal(a.Ip, b.Ip);
+            });
+            return res;
+        }
+
+        // 推荐的局域网地址（无可用地址时返回 null）
+        public static LanCandidate Best()
+        {
+            List<LanCandidate> all = Candidates();
+            return all.Count > 0 ? all[0] : null;
+        }
+
+        public static bool IsLoopback(string host)
+        {
+            string h = (host ?? "").Trim().ToLowerInvariant();
+            return h.Length == 0 || h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "[::1]";
+        }
+
+        // 该 host 是否仍是本机某个网卡上的地址（防止配置里留着已拔掉的网卡 IP）
+        public static bool IsLocalAddress(string host)
+        {
+            string h = (host ?? "").Trim();
+            if (h.Length == 0) return false;
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    foreach (UnicastIPAddressInformation ua in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (ua.Address != null && string.Equals(ua.Address.ToString(), h, StringComparison.OrdinalIgnoreCase)) return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────── 局域网访问配置对话框
+    // 只负责选择/确认，真正的改绑定地址与重启由主窗体做（它才有 StartAsync/StopAsync 上下文）
+    class LanAccessDialog : ThemedForm
+    {
+        public enum Action { Cancel, Enable, Disable }
+        public Action Chosen = Action.Cancel;
+        public string ChosenIp = "";
+
+        List<PillButton> nicButtons = new List<PillButton>();
+        List<LanCandidate> nics;
+        int picked;
+
+        public LanAccessDialog(InstanceConfig cfg, bool running, string authUrl)
+        {
+            bool lanOn = !Lan.IsLoopback(cfg.Host);
+            Text = "局域网访问";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size((int)Ui.P(520), (int)Ui.P(300));
+            ShowInTaskbar = false;
+
+            Theme T = Theme.Current;
+            int pad = (int)Ui.P(20);
+            int y = (int)Ui.P(16);
+
+            SectionLabel cur = MkLine("");
+            cur.Caption = lanOn
+                ? "当前：已开启 —— 绑定 " + cfg.Host + ":" + cfg.Port
+                : "当前：仅本机可访问 —— 绑定 " + cfg.Host + ":" + cfg.Port;
+            cur.UseTextColor = true;
+            cur.Location = new Point(pad, y);
+            cur.Size = new Size(ClientSize.Width - pad * 2, (int)Ui.P(20));
+            Controls.Add(cur);
+            y += (int)Ui.P(28);
+
+            if (lanOn)
+            {
+                SectionLabel url = MkLine("");
+                url.Caption = authUrl.Length > 0
+                    ? "局域网内设备访问地址（已捕获带令牌链接，可复制）："
+                    : "局域网内设备访问地址（首次访问需带令牌）：";
+                url.Faint = true;
+                url.Location = new Point(pad, y);
+                url.Size = new Size(ClientSize.Width - pad * 2, (int)Ui.P(20));
+                Controls.Add(url);
+                y += (int)Ui.P(24);
+
+                SectionLabel l2 = MkLine("");
+                l2.Caption = "http://" + cfg.Host + ":" + cfg.Port + "/?token=…";
+                l2.FontSize = 9.5f;
+                l2.UseTextColor = true;
+                l2.Location = new Point(pad, y);
+                l2.Size = new Size(ClientSize.Width - pad * 2, (int)Ui.P(22));
+                Controls.Add(l2);
+                y += (int)Ui.P(36);
+            }
+            else
+            {
+                nics = Lan.Candidates();
+                SectionLabel pick = MkLine("");
+                pick.Caption = nics.Count > 0 ? "选择用于局域网访问的网卡地址：" : "未检测到可用的局域网地址（只有回环/虚拟网卡）。";
+                pick.Location = new Point(pad, y);
+                pick.Size = new Size(ClientSize.Width - pad * 2, (int)Ui.P(20));
+                Controls.Add(pick);
+                y += (int)Ui.P(26);
+
+                picked = nics.Count > 0 ? 0 : -1;
+                for (int i = 0; i < nics.Count && i < 4; i++)
+                {
+                    LanCandidate c = nics[i];
+                    PillButton b = new PillButton();
+                    b.Kind = i == 0 ? PillButton.Variant.Primary : PillButton.Variant.Ghost;
+                    b.Label = c.Label;
+                    b.Size = new Size(ClientSize.Width - pad * 2, (int)Ui.P(30));
+                    b.Location = new Point(pad, y);
+                    int idx = i;
+                    b.Click += delegate { Pick(idx); };
+                    Controls.Add(b);
+                    nicButtons.Add(b);
+                    y += (int)Ui.P(34);
+                }
+                y += (int)Ui.P(2);
+            }
+
+            // 安全提示（拆两行：SectionLabel 单行绘制，长文案会被裁掉）
+            SectionLabel warn = MkLine("");
+            warn.Caption = "⚠ dsh 不接受 0.0.0.0（通配地址），只能绑具体网卡 IP。";
+            warn.FontSize = 8.5f;
+            warn.CustomColor = T.Warn;
+            warn.Location = new Point(pad, y);
+            warn.Size = new Size(ClientSize.Width - pad * 2, (int)Ui.P(18));
+            Controls.Add(warn);
+
+            SectionLabel warn2 = MkLine("");
+            warn2.Caption = lanOn
+                ? "服务以明文 HTTP 暴露在局域网，访问链接里带令牌，请仅在可信网络使用。"
+                : "服务为明文 HTTP 且令牌在 URL 中，请仅在可信网络开启。";
+            warn2.FontSize = 8.5f;
+            warn2.CustomColor = T.Warn;
+            warn2.Location = new Point(pad, y + (int)Ui.P(18));
+            warn2.Size = new Size(ClientSize.Width - pad * 2, (int)Ui.P(18));
+            Controls.Add(warn2);
+
+            int btnH = (int)Ui.P(32);
+            int by = ClientSize.Height - (int)Ui.P(18) - btnH;
+            int x = ClientSize.Width - pad - (int)Ui.P(84);
+
+            PillButton cancel = new PillButton();
+            cancel.Kind = PillButton.Variant.Ghost;
+            cancel.Label = "取消";
+            cancel.Size = new Size((int)Ui.P(84), btnH);
+            cancel.Location = new Point(x, by);
+            cancel.Click += delegate { Chosen = Action.Cancel; DialogResult = DialogResult.Cancel; Close(); };
+            Controls.Add(cancel);
+
+            if (lanOn)
+            {
+                int wOff = (int)Ui.P(108), wCopy = (int)Ui.P(124);
+                PillButton copy = new PillButton();
+                copy.Kind = PillButton.Variant.Primary;
+                copy.Label = "复制访问链接";
+                copy.Size = new Size(wCopy, btnH);
+                copy.Location = new Point(x - (int)Ui.P(10) - wCopy - (int)Ui.P(10) - wOff, by);
+                copy.Enabled = authUrl.Length > 0;
+                copy.Click += delegate
+                {
+                    try { Clipboard.SetText(authUrl.Length > 0 ? authUrl : "http://" + cfg.Host + ":" + cfg.Port); } catch { }
+                    Chosen = Action.Cancel;
+                    DialogResult = DialogResult.Cancel;
+                    Close();
+                };
+                Controls.Add(copy);
+
+                PillButton off = new PillButton();
+                off.Kind = PillButton.Variant.Ghost;
+                off.Label = "关闭局域网";
+                off.Size = new Size(wOff, btnH);
+                off.Location = new Point(x - (int)Ui.P(10) - wOff, by);
+                off.Click += delegate
+                {
+                    Chosen = Action.Disable;
+                    ChosenIp = "127.0.0.1";
+                    DialogResult = DialogResult.OK;
+                    Close();
+                };
+                Controls.Add(off);
+            }
+            else
+            {
+                PillButton on = new PillButton();
+                on.Kind = PillButton.Variant.Primary;
+                on.Label = "开启并重启";
+                on.Size = new Size((int)Ui.P(108), btnH);
+                on.Location = new Point(x - (int)Ui.P(10) - (int)Ui.P(108), by);
+                on.Enabled = nics != null && nics.Count > 0;
+                on.Click += delegate
+                {
+                    if (picked < 0 || nics == null || picked >= nics.Count) return;
+                    Chosen = Action.Enable;
+                    ChosenIp = nics[picked].Ip;
+                    DialogResult = DialogResult.OK;
+                    Close();
+                };
+                Controls.Add(on);
+            }
+        }
+
+        void Pick(int idx)
+        {
+            picked = idx;
+            for (int i = 0; i < nicButtons.Count; i++)
+            {
+                nicButtons[i].Kind = i == idx ? PillButton.Variant.Primary : PillButton.Variant.Ghost;
+                nicButtons[i].Invalidate();
+            }
+        }
+
+        static SectionLabel MkLine(string caption)
+        {
+            SectionLabel l = new SectionLabel();
+            l.Caption = caption;
+            l.Semibold = false;
+            l.FontSize = 9f;
+            return l;
         }
     }
 
@@ -3417,7 +3714,9 @@ namespace DshManager
             stLan.Size = new Size((int)Ui.P(454), (int)Ui.P(96));
             stLan.Title = "局域网访问";
             stLan.Value = "—";
-            stLan.Sub = "提示：跨设备访问需 --host 0.0.0.0 --trusted-host <设备IP>";
+            stLan.Sub = "点此设置：把绑定地址改成某个网卡 IP，供局域网内其他设备访问";
+            stLan.Cursor = Cursors.Hand;
+            stLan.Click += delegate { ShowLanAccess(); };
             page.Controls.Add(stLan);
 
             stEnv = new StatCard();
@@ -4668,18 +4967,34 @@ namespace DshManager
             {
                 AppendDiag("启动命令", Theme.Current.Accent);
                 AppendDiag("  dsh web --host " + selected.Cfg.Host + " --port " + selected.Cfg.Port, Theme.Current.LogText);
-                if (DshService.SupportsLan())
+                // 局域网访问：dsh 0.2.x 的策略是"只允许绑具体网卡 IP"（0.0.0.0 会被拒绝）
+                AppendDiag("局域网访问", Theme.Current.Accent);
+                if (!Lan.IsLoopback(selected.Cfg.Host))
                 {
-                    AppendDiag("  局域网访问：dsh web --host 0.0.0.0 --port " + selected.Cfg.Port + " --trusted-host <本机IP>", Theme.Current.LogText);
+                    AppendDiag("  已开启：绑定 " + selected.Cfg.Host + ":" + selected.Cfg.Port, Theme.Current.LogText);
+                    AppendDiag("  局域网内设备访问：http://" + selected.Cfg.Host + ":" + selected.Cfg.Port + "/?token=<启动日志里的令牌>", Theme.Current.LogText);
                 }
                 else
                 {
-                    AppendDiag("  局域网访问：暂不可用", Theme.Current.LogErr);
-                    AppendDiag("    DSH " + (DshService.DshVersion.Length > 0 ? DshService.DshVersion : "当前版本") + " 出于安全限制（防远程代码执行）拒绝 --host 0.0.0.0，", Theme.Current.LogText);
-                    AppendDiag("    服务只能监听 127.0.0.1，其他设备无法访问。", Theme.Current.LogText);
-                    AppendDiag("    请关注 DSH 后续版本是否放开 0.0.0.0 绑定；", Theme.Current.LogText);
-                    AppendDiag("    如需局域网使用，可用反向代理将 127.0.0.1:" + selected.Cfg.Port + " 暴露到局域网。", Theme.Current.LogText);
+                    AppendDiag("  当前仅本机可访问（绑定 " + selected.Cfg.Host + "）", Theme.Current.LogText);
+                    AppendDiag("  开启方式：概览页「局域网访问」卡 → 选一个网卡地址 → 开启并重启（等价于 --host <网卡IP>）", Theme.Current.LogText);
                 }
+                List<LanCandidate> lan = Lan.Candidates();
+                if (lan.Count == 0)
+                {
+                    AppendDiag("  本机可用网卡地址：未检测到（只有回环/虚拟网卡）", Theme.Current.LogWarn);
+                }
+                else
+                {
+                    string ips = "";
+                    foreach (LanCandidate c in lan)
+                    {
+                        if (ips.Length > 0) ips += "、";
+                        ips += c.Ip + (c.Virtual ? "（虚拟网卡）" : "");
+                    }
+                    AppendDiag("  本机可用网卡地址：" + ips, Theme.Current.LogText);
+                }
+                AppendDiag("  注意：dsh 不接受 --host 0.0.0.0（通配地址，会被拒绝）；服务是明文 HTTP 且令牌在 URL 里，请仅在可信网络开启。", Theme.Current.LogText);
             }
             AppendDiag("", Theme.Current.LogText);
             AppendDiag("本机 DSH 服务", Theme.Current.Accent);
@@ -4983,6 +5298,45 @@ namespace DshManager
             }
         }
 
+        // ── 局域网访问 ──
+        // 打开配置对话框 → 按选择改绑定地址 → 重启服务生效
+        void ShowLanAccess()
+        {
+            if (selected == null) return;
+            InstanceRuntime rt = selected;
+            bool running = rt.State == SvcState.Running || rt.Proc != null;
+            using (LanAccessDialog d = new LanAccessDialog(rt.Cfg, running, rt.AuthUrl))
+            {
+                if (d.ShowDialog(this) != DialogResult.OK) return;
+                if (d.Chosen == LanAccessDialog.Action.Enable && d.ChosenIp.Length > 0)
+                {
+                    ApplyBindHost(rt, d.ChosenIp, "已开启局域网访问：" + d.ChosenIp + ":" + rt.Cfg.Port);
+                }
+                else if (d.Chosen == LanAccessDialog.Action.Disable)
+                {
+                    ApplyBindHost(rt, "127.0.0.1", "已关闭局域网访问（改回 127.0.0.1）");
+                }
+            }
+        }
+
+        // 改绑定地址：dsh 的 --host 只在启动时生效，所以服务在跑就必须重启
+        void ApplyBindHost(InstanceRuntime rt, string host, string msg)
+        {
+            if (rt.Cfg.Host == host)
+            {
+                RefreshOverview();
+                return;
+            }
+            rt.Cfg.Host = host;
+            Settings.Save();
+            rt.AuthUrl = ""; // 换地址后令牌链接会变，等重启后重新捕获
+            RefreshOverview();
+            bool running = rt.State == SvcState.Running || rt.Proc != null || rt.State == SvcState.Starting;
+            if (running) RestartAsync(rt);
+            else PollStates();
+            try { tray.ShowBalloonTip(4000, "局域网访问", msg, ToolTipIcon.Info); } catch { }
+        }
+
         void UpdateSelectedUi()
         {
             if (selected == null) return;
@@ -5048,38 +5402,40 @@ namespace DshManager
             }
             if (stLan != null)
             {
-                if (!DshService.SupportsLan())
+                // 如实反映"实例绑定在哪"：dsh 0.2.x 只接受具体网卡 IP（拒绝 0.0.0.0），
+                // 所以局域网能不能用，取决于绑定地址本身，而不是"猜一个 IP 显示出来"。
+                string host = selected.Cfg.Host;
+                int port = selected.Cfg.Port;
+                if (host == "0.0.0.0" || host == "::" || host == "*")
                 {
-                    // DSH 0.1.0-rc 系列安全限制：拒绝 --host 0.0.0.0，局域网绑定不可用
-                    stLan.Value = "仅本机可访问";
-                    stLan.Sub = "DSH " + (DshService.DshVersion.Length > 0 ? DshService.DshVersion : "当前版本")
-                        + " 出于安全限制暂不支持局域网绑定（--host 0.0.0.0 被拒绝），详见「诊断」页";
-                    stLan.Invalidate();
+                    stLan.Value = "绑定地址无效";
+                    stLan.Sub = "dsh 拒绝 0.0.0.0（通配地址）· 点此改绑某个具体网卡 IP";
+                    stLan.ValueColor = Theme.Current.Err;
                 }
-                else
+                else if (!Lan.IsLoopback(host))
                 {
-                    List<string> ips = new List<string>();
-                    try
+                    stLan.Value = "http://" + host + ":" + port;
+                    if (!Lan.IsLocalAddress(host))
                     {
-                        IPAddress[] adds = Dns.GetHostEntry(Dns.GetHostName()).AddressList;
-                        foreach (IPAddress a in adds)
-                        {
-                            if (a.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(a)) ips.Add(a.ToString());
-                        }
-                    }
-                    catch { }
-                    if (ips.Count > 0)
-                    {
-                        stLan.Value = "http://" + ips[0] + ":" + selected.Cfg.Port;
-                        stLan.Sub = "局域网地址（如有多张网卡见诊断页）· 跨设备需 --trusted-host";
+                        stLan.Sub = "该地址已不在本机网卡上（换过网络？）· 点此重新设置";
+                        stLan.ValueColor = Theme.Current.Warn;
                     }
                     else
                     {
-                        stLan.Value = "仅本机可访问";
-                        stLan.Sub = "未检测到局域网地址";
+                        stLan.Sub = "局域网内其他设备用此地址访问（需带令牌）· 点此复制带令牌链接 / 关闭";
+                        stLan.ValueColor = Theme.Current.Ok;
                     }
-                    stLan.Invalidate();
                 }
+                else
+                {
+                    stLan.Value = "仅本机可访问";
+                    LanCandidate best = Lan.Best();
+                    stLan.Sub = best != null
+                        ? "点此开启局域网访问（推荐 " + best.Ip + " · " + best.Adapter + "）"
+                        : "点此设置局域网访问（未检测到可用网卡地址）";
+                    stLan.ValueColor = Color.Empty;
+                }
+                stLan.Invalidate();
             }
             if (stEnv != null)
             {
@@ -5115,6 +5471,12 @@ namespace DshManager
             btnStop.Enabled = !busy && (st == SvcState.Running || st == SvcState.Occupied || st == SvcState.Starting);
             btnRestart.Enabled = !busy && st != SvcState.Starting;
             btnBrowser.Enabled = true;
+
+            // 概览页左上角的实例名是在页面的 Paint 里画的（不是控件），上面这些 Invalidate 只重绘卡片，
+            // 页面本身不会重绘 —— 切实例后标题会一直停在上一个实例的名字上。这里显式让页面重绘。
+            // （DoubleBuffered，代价就是一次全页重绘，很便宜）
+            Control ov;
+            if (tabPages != null && tabPages.TryGetValue("overview", out ov) && ov != null) ov.Invalidate();
         }
 
         void RefreshHeadPill()
